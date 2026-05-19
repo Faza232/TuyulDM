@@ -1,0 +1,564 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+type VideoManifestPreview struct {
+	ManifestType      string         `json:"manifestType"`
+	SelectedVariantID string         `json:"selectedVariantId"`
+	Variants          []VideoVariant `json:"variants"`
+}
+
+type videoTrackInput struct {
+	Track string
+	Path  string
+}
+
+func (e *Engine) AddVideo(req VideoDownloadRequest) (*DownloadState, error) {
+	if strings.TrimSpace(req.URL) == "" {
+		return nil, fmt.Errorf("url is required")
+	}
+
+	headers := sanitizeRequestHeaders(req.Headers)
+	cookies := sanitizeRequestCookies(req.Cookies)
+	manifest, err := resolveVideoManifest(context.Background(), VideoDownloadRequest{
+		URL:               req.URL,
+		Filename:          req.Filename,
+		ManifestType:      req.ManifestType,
+		SelectedVariantID: req.SelectedVariantID,
+		Segments:          req.Segments,
+		Headers:           headers,
+		Cookies:           cookies,
+		Schedule:          req.Schedule,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	filename, outputPath, err := resolveDownloadTarget(req.URL, ensureVideoFilename(req.Filename))
+	if err != nil {
+		return nil, err
+	}
+
+	parallelism := req.Segments
+	if parallelism <= 0 {
+		parallelism = defaultSegments
+	}
+
+	totalSize, knownSize := totalKnownSegmentBytes(manifest.Segments)
+	if !knownSize {
+		totalSize = 0
+	}
+
+	id := fmt.Sprintf("%d%d", os.Getpid(), time.Now().UnixNano())
+	state := &DownloadState{
+		ID:                id,
+		URL:               req.URL,
+		Filename:          filename,
+		OutputPath:        outputPath,
+		TotalSize:         totalSize,
+		Status:            "queued",
+		Type:              "video",
+		CreatedAt:         time.Now(),
+		Headers:           headers,
+		Cookies:           cookies,
+		ManifestType:      manifest.ManifestType,
+		SelectedVariantID: manifest.SelectedVariantID,
+		VideoContainer:    manifest.Container,
+		Parallelism:       parallelism,
+		Variants:          manifest.Variants,
+		Segments:          manifest.Segments,
+		Schedule:          cloneDownloadSchedule(req.Schedule),
+	}
+
+	if err := e.storage.SaveDownload(state); err != nil {
+		return nil, err
+	}
+
+	return state, nil
+}
+
+func previewVideoManifest(ctx context.Context, req VideoDownloadRequest) (VideoManifestPreview, error) {
+	manifest, err := resolveVideoManifest(ctx, req)
+	if err != nil {
+		return VideoManifestPreview{}, err
+	}
+
+	return VideoManifestPreview{
+		ManifestType:      manifest.ManifestType,
+		SelectedVariantID: manifest.SelectedVariantID,
+		Variants:          manifest.Variants,
+	}, nil
+}
+
+func ensureVideoFilename(requested string) string {
+	trimmed := strings.TrimSpace(requested)
+	if trimmed == "" {
+		return fmt.Sprintf("Video_%d.mp4", time.Now().Unix())
+	}
+	if strings.EqualFold(filepath.Ext(trimmed), ".mp4") {
+		return trimmed
+	}
+	return strings.TrimSuffix(trimmed, filepath.Ext(trimmed)) + ".mp4"
+}
+
+func totalKnownSegmentBytes(segments []Segment) (int64, bool) {
+	var total int64
+	for _, segment := range segments {
+		if segment.End < segment.Start || segment.End < 0 {
+			return 0, false
+		}
+		total += segment.End - segment.Start + 1
+	}
+	return total, len(segments) > 0
+}
+
+func (e *Engine) runVideoDownload(a *ActiveDownload) {
+	segmentDir, err := videoSegmentDir(a.State)
+	if err != nil {
+		e.failDownload(a, err)
+		return
+	}
+
+	done := make(chan struct{})
+	go e.reportVideoProgress(a, done)
+
+	var lastError error
+	jobs := make(chan int)
+	var workers sync.WaitGroup
+	workerCount := resolvedVideoParallelism(a.State)
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
+	for workerIndex := 0; workerIndex < workerCount; workerIndex++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for segmentIndex := range jobs {
+				if err := e.downloadVideoSegment(a, segmentIndex, segmentDir); err != nil && !errors.Is(err, context.Canceled) {
+					a.mu.Lock()
+					if lastError == nil {
+						lastError = err
+						a.State.Error = err.Error()
+						a.Cancel()
+					}
+					a.mu.Unlock()
+				}
+			}
+		}()
+	}
+
+	for index := range a.State.Segments {
+		if a.State.Segments[index].Completed {
+			continue
+		}
+		jobs <- index
+	}
+	close(jobs)
+	workers.Wait()
+	close(done)
+
+	if lastError == nil && a.Ctx.Err() == nil {
+		var inputs []videoTrackInput
+		inputs, err = e.prepareVideoTrackInputs(a.State, segmentDir)
+		if err == nil {
+			err = e.muxVideoSegments(a, inputs, downloadPath(a.State))
+		}
+		if err == nil {
+			_ = os.RemoveAll(segmentDir)
+		}
+	} else {
+		err = lastError
+	}
+
+	e.releaseActiveSlot(a.State.ID)
+
+	a.mu.Lock()
+	if err != nil {
+		if errors.Is(a.Ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
+			a.State.Status = "paused"
+		} else {
+			a.State.Status = "error"
+			a.State.Error = err.Error()
+		}
+		a.State.Speed = "0 B/s"
+	} else {
+		a.State.Status = "finished"
+		a.State.Progress = 100
+		a.State.Speed = "0 B/s"
+		a.State.Error = ""
+		if info, statErr := os.Stat(downloadPath(a.State)); statErr == nil {
+			a.State.TotalSize = info.Size()
+		}
+	}
+	snapshot := cloneDownloadState(a.State)
+	a.mu.Unlock()
+
+	e.persistSnapshot(snapshot)
+}
+
+func (e *Engine) reportVideoProgress(a *ActiveDownload, done <-chan struct{}) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	var lastBytes int64
+	for {
+		select {
+		case <-ticker.C:
+			snapshot := func() DownloadState {
+				a.mu.Lock()
+				defer a.mu.Unlock()
+
+				currentBytes := downloadedBytes(a.State)
+				diff := currentBytes - lastBytes
+				lastBytes = currentBytes
+
+				if a.State.TotalSize > 0 {
+					a.State.Progress = float64(currentBytes) / float64(a.State.TotalSize) * 100
+				} else {
+					a.State.Progress = videoSegmentProgress(a.State)
+				}
+				a.State.Speed = formatSpeed(diff * 2)
+				return cloneDownloadState(a.State)
+			}()
+
+			e.persistSnapshot(snapshot)
+		case <-done:
+			return
+		case <-a.Ctx.Done():
+			return
+		}
+	}
+}
+
+func videoSegmentProgress(state *DownloadState) float64 {
+	if len(state.Segments) == 0 {
+		return 0
+	}
+
+	var completed float64
+	for _, segment := range state.Segments {
+		if segment.Completed {
+			completed += 1
+			continue
+		}
+		if segment.End >= segment.Start && segment.End >= 0 {
+			length := float64(segment.End - segment.Start + 1)
+			if length > 0 {
+				completed += math.Min(1, float64(segment.Current)/length)
+			}
+		}
+	}
+
+	return completed / float64(len(state.Segments)) * 100
+}
+
+func resolvedVideoParallelism(state *DownloadState) int {
+	if state.Parallelism > 0 {
+		return state.Parallelism
+	}
+	return minInt(defaultSegments, len(state.Segments))
+}
+
+func minInt(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (e *Engine) downloadVideoSegment(a *ActiveDownload, idx int, segmentDir string) error {
+	for attempt := 0; attempt < maxSegmentRetries; attempt++ {
+		err := e.downloadVideoSegmentAttempt(a, idx, segmentDir)
+		if err == nil {
+			return nil
+		}
+
+		var retryErr *retryableStatusError
+		if errors.As(err, &retryErr) {
+			if attempt == maxSegmentRetries-1 {
+				return err
+			}
+			if waitErr := waitForRetry(a.Ctx, retryErr.RetryAfter); waitErr != nil {
+				return waitErr
+			}
+			continue
+		}
+
+		return err
+	}
+
+	return fmt.Errorf("video segment %d exhausted retries", idx)
+}
+
+func (e *Engine) downloadVideoSegmentAttempt(a *ActiveDownload, idx int, segmentDir string) error {
+	a.mu.Lock()
+	segment := a.State.Segments[idx]
+	headers := cloneStringMap(a.State.Headers)
+	cookies := append([]RequestCookie(nil), a.State.Cookies...)
+	perDownloadLimiter := a.PerDownloadLimiter
+	a.mu.Unlock()
+
+	if segment.Completed {
+		return nil
+	}
+
+	partPath := videoSegmentPartPath(segmentDir, segment.Index)
+	file, resumeOffset, err := prepareVideoSegmentFile(a, idx, partPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	if segment.End >= segment.Start && segment.End >= 0 {
+		expectedLength := segment.End - segment.Start + 1
+		if resumeOffset >= expectedLength {
+			return e.completeSegment(a, idx)
+		}
+	}
+
+	client, err := newHTTPClient(segment.URL, cookies, true)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(a.Ctx, http.MethodGet, segment.URL, nil)
+	if err != nil {
+		return err
+	}
+	applyRequestHeaders(req, headers, cookies)
+
+	rangeRequested := false
+	writeOffset := resumeOffset
+	switch {
+	case segment.End >= segment.Start && segment.End >= 0:
+		requestStart := segment.Start + resumeOffset
+		if requestStart > segment.End {
+			return e.completeSegment(a, idx)
+		}
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", requestStart, segment.End))
+		rangeRequested = true
+	case resumeOffset > 0:
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeOffset))
+		rangeRequested = true
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	reader := newThrottledReader(a.Ctx, resp.Body, perDownloadLimiter, e.globalLimiterSnapshot())
+
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+		return &retryableStatusError{StatusCode: resp.StatusCode, RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
+	}
+
+	switch {
+	case rangeRequested && segment.End >= segment.Start && segment.End >= 0 && resp.StatusCode != http.StatusPartialContent:
+		return fmt.Errorf("video range request returned status %d", resp.StatusCode)
+	case rangeRequested && segment.End < 0 && resumeOffset > 0 && resp.StatusCode == http.StatusOK:
+		if err := file.Truncate(0); err != nil {
+			return err
+		}
+		writeOffset = 0
+		a.mu.Lock()
+		a.State.Segments[idx].Current = 0
+		a.mu.Unlock()
+	case !rangeRequested && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent:
+		return fmt.Errorf("unexpected video segment status %d", resp.StatusCode)
+	case rangeRequested && resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK:
+		return fmt.Errorf("unexpected video segment status %d", resp.StatusCode)
+	}
+
+	buf := make([]byte, 32*1024)
+	for {
+		n, readErr := reader.Read(buf)
+		if n > 0 {
+			written, writeErr := file.WriteAt(buf[:n], writeOffset)
+			if writeErr != nil {
+				return writeErr
+			}
+			if written != n {
+				return io.ErrShortWrite
+			}
+			writeOffset += int64(n)
+
+			a.mu.Lock()
+			a.State.Segments[idx].Current = writeOffset
+			a.mu.Unlock()
+		}
+
+		if readErr != nil {
+			if readErr == io.EOF {
+				return e.completeSegment(a, idx)
+			}
+			return readErr
+		}
+	}
+}
+
+func prepareVideoSegmentFile(a *ActiveDownload, idx int, path string) (*os.File, int64, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, 0, err
+	}
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, 0, err
+	}
+
+	resumeOffset := info.Size()
+	a.mu.Lock()
+	segment := a.State.Segments[idx]
+	a.mu.Unlock()
+
+	if segment.End >= segment.Start && segment.End >= 0 {
+		expectedLength := segment.End - segment.Start + 1
+		if resumeOffset > expectedLength {
+			if err := file.Truncate(expectedLength); err != nil {
+				_ = file.Close()
+				return nil, 0, err
+			}
+			resumeOffset = expectedLength
+		}
+	}
+
+	a.mu.Lock()
+	a.State.Segments[idx].Current = resumeOffset
+	a.mu.Unlock()
+
+	return file, resumeOffset, nil
+}
+
+func videoSegmentDir(state *DownloadState) (string, error) {
+	downloadsDir, err := DownloadsDir()
+	if err != nil {
+		return "", err
+	}
+
+	path := filepath.Join(downloadsDir, ".segments", state.ID)
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func videoSegmentPartPath(segmentDir string, index int) string {
+	return filepath.Join(segmentDir, fmt.Sprintf("%04d.part", index))
+}
+
+func (e *Engine) prepareVideoTrackInputs(state *DownloadState, segmentDir string) ([]videoTrackInput, error) {
+	groups := make(map[string][]Segment)
+	for _, segment := range state.Segments {
+		track := segment.Track
+		if track == "" {
+			track = "muxed"
+		}
+		groups[track] = append(groups[track], segment)
+	}
+
+	inputs := make([]videoTrackInput, 0, len(groups))
+	for _, track := range orderedTrackNames(groups) {
+		outputPath := filepath.Join(segmentDir, track+trackContainerExt(state, track))
+		outputFile, err := os.OpenFile(outputPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, segment := range groups[track] {
+			partFile, err := os.Open(videoSegmentPartPath(segmentDir, segment.Index))
+			if err != nil {
+				_ = outputFile.Close()
+				return nil, err
+			}
+			if _, err := io.Copy(outputFile, partFile); err != nil {
+				_ = partFile.Close()
+				_ = outputFile.Close()
+				return nil, err
+			}
+			_ = partFile.Close()
+		}
+
+		if err := outputFile.Close(); err != nil {
+			return nil, err
+		}
+		inputs = append(inputs, videoTrackInput{Track: track, Path: outputPath})
+	}
+
+	return inputs, nil
+}
+
+func orderedTrackNames(groups map[string][]Segment) []string {
+	preferredOrder := []string{"video", "audio", "muxed"}
+	ordered := make([]string, 0, len(groups))
+	for _, track := range preferredOrder {
+		if _, ok := groups[track]; ok {
+			ordered = append(ordered, track)
+		}
+	}
+	for track := range groups {
+		if track == "video" || track == "audio" || track == "muxed" {
+			continue
+		}
+		ordered = append(ordered, track)
+	}
+	return ordered
+}
+
+func trackContainerExt(state *DownloadState, track string) string {
+	if state.ManifestType == manifestTypeHLS && state.VideoContainer == "ts" && track == "muxed" {
+		return ".ts"
+	}
+	return ".mp4"
+}
+
+func (e *Engine) muxVideoSegments(a *ActiveDownload, inputs []videoTrackInput, output string) error {
+	a.mu.Lock()
+	a.State.Status = "muxing"
+	a.State.Speed = "muxing"
+	snapshot := cloneDownloadState(a.State)
+	a.mu.Unlock()
+
+	e.persistSnapshot(snapshot)
+
+	ffmpegBinary, err := ResolveFFmpegBinary()
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(output); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	args := []string{"-y"}
+	for _, input := range inputs {
+		args = append(args, "-i", input.Path)
+	}
+	args = append(args, "-c", "copy")
+	if len(inputs) == 1 && strings.HasSuffix(strings.ToLower(inputs[0].Path), ".ts") {
+		args = append(args, "-bsf:a", "aac_adtstoasc")
+	}
+	args = append(args, "-movflags", "+faststart", output)
+
+	cmd := exec.CommandContext(a.Ctx, ffmpegBinary, args...)
+	return cmd.Run()
+}

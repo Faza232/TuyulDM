@@ -17,10 +17,22 @@ cd native-host
 go build -o tuyuldm-daemon ./...
 ```
 
+For video downloads, the daemon expects a bundled ffmpeg sidecar next to the built binary:
+
+- Linux: `native-host/bin/ffmpeg-linux-amd64` or `native-host/bin/ffmpeg-linux-arm64`
+- macOS: `native-host/bin/ffmpeg-darwin-amd64` or `native-host/bin/ffmpeg-darwin-arm64`
+- Windows: `native-host/bin/ffmpeg-windows-amd64.exe`
+
+During local development you can override this with `TUYULDM_FFMPEG=/absolute/path/to/ffmpeg`.
+
 ### 2. Load the Extension
+1. Build the extension bundle:
+	```bash
+	npm run build
+	```
 1. Open Chrome/Brave and go to `chrome://extensions`.
 2. Enable "Developer mode".
-3. Click "Load unpacked" and select the `/extension` folder in this project.
+3. Click "Load unpacked" and select the `/dist` folder in this project.
 4. Note the Extension ID (e.g., `abcdefg...`).
 
 ### 3. Register the Native Host

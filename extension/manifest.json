@@ -3,12 +3,18 @@
   "name": "TuyulDM",
   "description": "Invisible helpers for your downloads.",
   "version": "0.1.0",
-  "permissions": ["nativeMessaging", "downloads", "webRequest", "storage", "scripting"],
-  "host_permissions": ["<all_urls>"],
+  "permissions": ["nativeMessaging", "downloads", "webRequest", "cookies", "storage", "scripting", "activeTab"],
+  "host_permissions": [],
+  "optional_host_permissions": ["<all_urls>"],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "extension/src/background/index.ts",
+    "type": "module"
   },
   "action": {
-    "default_popup": "index.html"
+    "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   }
 }

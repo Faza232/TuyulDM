@@ -3,38 +3,95 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 
 	"go.etcd.io/bbolt"
 )
 
 type DownloadState struct {
-	ID          string    `json:"id"`
-	URL         string    `json:"url"`
-	Filename    string    `json:"filename"`
-	TotalSize   int64     `json:"total_size"`
-	Status      string    `json:"status"`
-	Progress    float64   `json:"progress"`
-	Speed       string    `json:"speed"`
-	Type        string    `json:"type"` // "file" or "video"
-	Error       string    `json:"error,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	Segments    []Segment `json:"segments"`
+	ID                string            `json:"id"`
+	URL               string            `json:"url"`
+	Filename          string            `json:"filename"`
+	OutputPath        string            `json:"output_path,omitempty"`
+	TotalSize         int64             `json:"total_size"`
+	Status            string            `json:"status"`
+	Progress          float64           `json:"progress"`
+	Speed             string            `json:"speed"`
+	Type              string            `json:"type"` // "file" or "video"
+	Error             string            `json:"error,omitempty"`
+	CreatedAt         time.Time         `json:"created_at"`
+	Headers           map[string]string `json:"headers,omitempty"`
+	Cookies           []RequestCookie   `json:"cookies,omitempty"`
+	ContentMD5        string            `json:"content_md5,omitempty"`
+	Digest            string            `json:"digest,omitempty"`
+	ManifestType      string            `json:"manifest_type,omitempty"`
+	SelectedVariantID string            `json:"selected_variant_id,omitempty"`
+	VideoContainer    string            `json:"video_container,omitempty"`
+	Parallelism       int               `json:"parallelism,omitempty"`
+	Variants          []VideoVariant    `json:"variants,omitempty"`
+	Segments          []Segment         `json:"segments"`
+	Schedule          *DownloadSchedule `json:"schedule,omitempty"`
+	WasUserPaused     bool              `json:"was_user_paused,omitempty"`
+}
+
+type DownloadSchedule struct {
+	StartHour int   `json:"start_hour"`
+	EndHour   int   `json:"end_hour"`
+	Days      []int `json:"days,omitempty"`
+}
+
+type VideoVariant struct {
+	ID         string `json:"id"`
+	Name       string `json:"name,omitempty"`
+	Bandwidth  int64  `json:"bandwidth,omitempty"`
+	Resolution string `json:"resolution,omitempty"`
+	Codecs     string `json:"codecs,omitempty"`
+	URL        string `json:"url,omitempty"`
+}
+
+type RequestCookie struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Domain string `json:"domain,omitempty"`
+	Path   string `json:"path,omitempty"`
+}
+
+func (c RequestCookie) normalizedPath() string {
+	if c.Path == "" {
+		return "/"
+	}
+	return c.Path
+}
+
+func (c RequestCookie) toHTTPCookie() *http.Cookie {
+	return &http.Cookie{
+		Name:   c.Name,
+		Value:  c.Value,
+		Domain: c.Domain,
+		Path:   c.normalizedPath(),
+	}
 }
 
 type Segment struct {
-	Index     int   `json:"index"`
-	Start     int64 `json:"start"`
-	End       int64 `json:"end"`
-	Current   int64 `json:"current"`
-	Completed bool  `json:"completed"`
+	Index     int     `json:"index"`
+	Start     int64   `json:"start"`
+	End       int64   `json:"end"`
+	Current   int64   `json:"current"`
+	Completed bool    `json:"completed"`
+	URL       string  `json:"url,omitempty"`
+	Track     string  `json:"track,omitempty"`
+	Duration  float64 `json:"duration,omitempty"`
 }
 
 type Storage struct {
 	db *bbolt.DB
 }
 
-const bucketName = "Downloads"
+const (
+	bucketName             = "Downloads"
+	hostSettingsBucketName = "HostSettings"
+)
 
 func NewStorage(path string) (*Storage, error) {
 	db, err := bbolt.Open(path, 0600, &bbolt.Options{Timeout: 1 * time.Second})
@@ -44,6 +101,10 @@ func NewStorage(path string) (*Storage, error) {
 
 	err = db.Update(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists([]byte(bucketName))
+		if err != nil {
+			return err
+		}
+		_, err = tx.CreateBucketIfNotExists([]byte(hostSettingsBucketName))
 		return err
 	})
 	if err != nil {
@@ -90,4 +151,57 @@ func (s *Storage) ListDownloads() ([]DownloadState, error) {
 		})
 	})
 	return list, err
+}
+
+func (s *Storage) PauseActiveDownloads() error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(bucketName))
+		return b.ForEach(func(k, v []byte) error {
+			var d DownloadState
+			if err := json.Unmarshal(v, &d); err != nil {
+				return err
+			}
+
+			if d.Status != "downloading" && d.Status != "muxing" {
+				return nil
+			}
+
+			d.Status = "paused"
+			d.Speed = "0 B/s"
+			d.WasUserPaused = false
+			data, err := json.Marshal(&d)
+			if err != nil {
+				return err
+			}
+			return b.Put(k, data)
+		})
+	})
+}
+
+func (s *Storage) GetHostSettings() (HostSettings, error) {
+	settings := defaultHostSettings()
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(hostSettingsBucketName))
+		if bucket == nil {
+			return nil
+		}
+		value := bucket.Get([]byte("settings"))
+		if value == nil {
+			return nil
+		}
+		return json.Unmarshal(value, &settings)
+	})
+	return normalizeHostSettings(settings), err
+}
+
+func (s *Storage) SaveHostSettings(settings HostSettings) error {
+	normalized := normalizeHostSettings(settings)
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket([]byte(hostSettingsBucketName))
+		data, err := json.Marshal(&normalized)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte("settings"), data)
+	})
 }
