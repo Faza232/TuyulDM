@@ -35,17 +35,48 @@ interface DownloadItem {
   id: number | string;
   name?: string;
   filename?: string;
+  url?: string;
   output_path?: string;
   size?: string;
   total_size?: number;
   progress: number;
   speed: string;
   speed_bytes_per_second?: number;
-  status: 'downloading' | 'paused' | 'finished' | 'queued' | 'error' | 'muxing';
+  status: 'downloading' | 'paused' | 'finished' | 'queued' | 'error' | 'muxing' | 'awaiting_url_refresh';
   type?: string;
   error?: string;
   error_code?: string;
   last_attempt_at?: string;
+}
+
+interface RefreshUrlResponse {
+	download?: DownloadItem;
+	error?: string;
+	code?: string;
+	details?: Record<string, unknown> | null;
+}
+
+interface ActiveTabUrlResponse {
+	url?: string;
+	error?: string;
+}
+
+interface RefreshUrlDialogState {
+	id: number | string;
+	label: string;
+	currentUrl: string;
+}
+
+interface RefreshUrlMismatchState {
+	code?: string;
+	message: string;
+	details?: Record<string, unknown> | null;
+}
+
+interface RefreshUrlContextMenuState {
+	id: number | string;
+	x: number;
+	y: number;
 }
 
 interface InterceptionSettings {
@@ -383,6 +414,9 @@ function formatDownloadSpeed(download: DownloadItem) {
   if (download.status === 'muxing') {
     return 'Muxing';
   }
+  if (download.status === 'awaiting_url_refresh' || download.error_code === 'url_expired') {
+    return 'Awaiting refresh';
+  }
 
   const rawSpeed = Number(download.speed_bytes_per_second ?? 0);
   if (Number.isFinite(rawSpeed) && rawSpeed > 0) {
@@ -402,6 +436,73 @@ function formatAttemptTimestamp(value: string | undefined) {
     return value;
   }
   return timestamp.toLocaleString();
+}
+
+function getDownloadLabel(download: DownloadItem) {
+  return download.name || download.filename || `Download ${download.id}`;
+}
+
+function downloadNeedsUrlRefresh(download: DownloadItem) {
+  return download.status === 'awaiting_url_refresh' || download.error_code === 'url_expired';
+}
+
+function canForceRefreshWithoutValidators(code: string | undefined) {
+  return code === 'validators_missing';
+}
+
+function canRestartRefreshFromScratch(code: string | undefined) {
+  return ['size_mismatch', 'etag_mismatch', 'last_modified_mismatch', 'accept_ranges_required'].includes(code || '');
+}
+
+function formatRefreshIssueTitle(code: string | undefined) {
+  switch (code) {
+    case 'size_mismatch':
+      return 'Fresh URL points to different size';
+    case 'etag_mismatch':
+      return 'Fresh URL points to different ETag';
+    case 'last_modified_mismatch':
+      return 'Fresh URL points to different last-modified value';
+    case 'validators_missing':
+      return 'Fresh URL dropped validators';
+    case 'accept_ranges_required':
+      return 'Fresh URL cannot resume with ranges';
+    default:
+      return 'Refresh needs review';
+  }
+}
+
+function formatRefreshDetailLabel(key: string) {
+  switch (key) {
+    case 'expectedTotalSize':
+      return 'Expected Size';
+    case 'actualTotalSize':
+      return 'New Size';
+    case 'oldETag':
+      return 'Old ETag';
+    case 'newETag':
+      return 'New ETag';
+    case 'oldLastModified':
+      return 'Old Last-Modified';
+    case 'newLastModified':
+      return 'New Last-Modified';
+    case 'acceptRanges':
+      return 'Accept-Ranges';
+    default:
+      return key;
+  }
+}
+
+function formatRefreshDetailValue(key: string, value: unknown) {
+  if (typeof value === 'number' && key.toLowerCase().includes('size')) {
+    return formatSize(value);
+  }
+  if (typeof value === 'boolean') {
+    return value ? 'yes' : 'no';
+  }
+  if (value == null || value === '') {
+    return 'unknown';
+  }
+  return String(value);
 }
 
 function formatDetectedTimestamp(value: number | undefined) {
@@ -534,6 +635,13 @@ export default function App({ surface = 'dashboard' }: AppProps) {
   const [downloadDirError, setDownloadDirError] = useState<string | null>(null);
   // TODO: extend single-item removal flow to multi-select actions.
   const [removalTarget, setRemovalTarget] = useState<{ id: number | string; status: DownloadItem['status'] } | null>(null);
+	const [refreshUrlDialog, setRefreshUrlDialog] = useState<RefreshUrlDialogState | null>(null);
+	const [refreshUrlInput, setRefreshUrlInput] = useState('');
+	const [refreshUrlError, setRefreshUrlError] = useState<string | null>(null);
+	const [refreshUrlMismatch, setRefreshUrlMismatch] = useState<RefreshUrlMismatchState | null>(null);
+	const [isRefreshingUrl, setIsRefreshingUrl] = useState(false);
+	const [isLoadingCurrentTabUrl, setIsLoadingCurrentTabUrl] = useState(false);
+	const [refreshContextMenu, setRefreshContextMenu] = useState<RefreshUrlContextMenuState | null>(null);
   const [scheduleEnabled, setScheduleEnabled] = useState(false);
   const [scheduleStartHour, setScheduleStartHour] = useState(2);
   const [scheduleEndHour, setScheduleEndHour] = useState(6);
@@ -848,7 +956,117 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     resetAddDownloadForm();
   };
 
-  const togglePlayPause = async (id: number | string, currentStatus: string) => {
+  const closeRefreshUrlModal = () => {
+    setRefreshUrlDialog(null);
+    setRefreshUrlInput('');
+    setRefreshUrlError(null);
+    setRefreshUrlMismatch(null);
+    setIsRefreshingUrl(false);
+    setIsLoadingCurrentTabUrl(false);
+  };
+
+  const openRefreshUrlModal = (download: DownloadItem, nextUrl = '') => {
+    setRefreshContextMenu(null);
+    setRefreshUrlDialog({
+      id: download.id,
+      label: getDownloadLabel(download),
+      currentUrl: download.url || '',
+    });
+    setRefreshUrlInput(nextUrl || download.url || '');
+    setRefreshUrlError(null);
+    setRefreshUrlMismatch(null);
+  };
+
+  const loadCurrentTabUrlIntoRefreshModal = async (download: DownloadItem) => {
+    openRefreshUrlModal(download, refreshUrlInput);
+    if (!isExtensionRuntimeAvailable()) {
+      setRefreshUrlError('Current tab shortcut requires extension runtime.');
+      return;
+    }
+
+    setIsLoadingCurrentTabUrl(true);
+    try {
+      const response = await sendExtensionMessage<ActiveTabUrlResponse>({ type: 'GET_ACTIVE_TAB_URL' });
+      if (response?.error) {
+        setRefreshUrlError(response.error);
+        return;
+      }
+      const nextUrl = String(response?.url || '').trim();
+      if (!isValidDownloadUrl(nextUrl)) {
+        setRefreshUrlError('Current tab URL is not valid http(s) download link.');
+        return;
+      }
+      setRefreshUrlInput(nextUrl);
+      setRefreshUrlError(null);
+      setRefreshUrlMismatch(null);
+    } finally {
+      setIsLoadingCurrentTabUrl(false);
+    }
+  };
+
+  const submitRefreshDownloadUrl = async ({ force = false, restartFromScratch = false }: { force?: boolean; restartFromScratch?: boolean } = {}) => {
+    if (!refreshUrlDialog) {
+      return;
+    }
+
+    const nextUrl = refreshUrlInput.trim();
+    if (!isValidDownloadUrl(nextUrl)) {
+      setRefreshUrlError('Enter valid http(s) URL before refreshing.');
+      return;
+    }
+
+    setIsRefreshingUrl(true);
+    setRefreshUrlError(null);
+    if (!force && !restartFromScratch) {
+      setRefreshUrlMismatch(null);
+    }
+
+    try {
+      let response: RefreshUrlResponse | undefined;
+      if (isExtensionRuntimeAvailable()) {
+        response = await sendExtensionMessage<RefreshUrlResponse>({
+          type: 'REFRESH_DOWNLOAD_URL',
+          id: refreshUrlDialog.id,
+          url: nextUrl,
+          force,
+          restartFromScratch,
+        });
+      } else {
+        response = await fetch(`/api/downloads/${refreshUrlDialog.id}/refresh-url`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: nextUrl, force, restartFromScratch }),
+        }).then((result) => result.json());
+      }
+
+      if (response?.error) {
+        setRefreshUrlError(response.error);
+        setRefreshUrlMismatch(response.code ? { code: response.code, message: response.error, details: response.details ?? null } : null);
+        return;
+      }
+
+      closeRefreshUrlModal();
+      if (isExtensionRuntimeAvailable()) {
+        void refreshDownloads();
+        void refreshHostStats();
+      } else {
+        await refreshPreviewData();
+      }
+    } catch (error) {
+      setRefreshUrlError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIsRefreshingUrl(false);
+    }
+  };
+
+  const togglePlayPause = async (download: DownloadItem) => {
+    if (downloadNeedsUrlRefresh(download)) {
+      openRefreshUrlModal(download);
+      return;
+    }
+
+    const currentStatus = download.status;
+    const id = download.id;
     if (isExtensionRuntimeAvailable()) {
       await sendExtensionMessage({
         type: currentStatus === 'downloading' || currentStatus === 'queued' || currentStatus === 'muxing' ? 'PAUSE_DOWNLOAD' : 'RESUME_DOWNLOAD',
@@ -1969,92 +2187,138 @@ export default function App({ surface = 'dashboard' }: AppProps) {
                         </button>
                       </div>
                     </div>
-                  ) : filteredDownloads.map((download) => (
-                    <motion.div
-                      key={download.id}
-                      layout
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0, scale: 0.95 }}
-                      className="data-row grid grid-cols-[40px_1fr_120px_180px_120px_160px] gap-4 px-3 py-3 items-center group"
-                    >
-                  <div className="data-value opacity-40">{typeof download.id === 'number' ? download.id.toString().padStart(2, '0') : download.id.substring(0, 4)}</div>
-                  <div className="flex flex-col min-w-0 pr-4">
-                    <div className="font-medium truncate text-[13px] text-white/90">{download.name || download.filename}</div>
-                    {download.output_path && (
-                      <div className="mt-1 flex items-center gap-1.5 min-w-0">
-                        <div className="truncate text-[10px] font-mono text-white/35" title={download.output_path}>{getDownloadParentDirectory(download.output_path)}</div>
-                        <button
-                          type="button"
-                          onClick={() => void copyPathToClipboard(download.output_path)}
-                          className="flex-none rounded-md p-1 text-white/35 transition-colors hover:bg-white/10 hover:text-white/80"
-                          title="Copy full output path"
-                        >
-                          <Copy className="w-3 h-3" />
-                        </button>
-                      </div>
-                    )}
-                    {download.status === 'error' && (download.error || download.error_code || download.last_attempt_at) && (
-                      <div className="mt-0.5">
-                        {download.error && <div className="text-xs text-red-400 truncate" title={download.error}>{download.error}</div>}
-                        {(download.error_code || download.last_attempt_at) && (
-                          <div className="mt-1 hidden rounded-md border border-red-500/20 bg-red-500/10 px-2.5 py-2 text-[10px] font-mono text-red-200 shadow-lg group-hover:block">
-                            {download.error_code && <div>Code: {download.error_code}</div>}
-                            {download.last_attempt_at && <div>Last Attempt: {formatAttemptTimestamp(download.last_attempt_at)}</div>}
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                  <div className="data-value">{formatSize((download as any).total_size ?? download.size ?? 0)}</div>
-                  <div className="space-y-2 pr-4">
-                    <div className="flex justify-between text-[10px] uppercase font-mono tracking-widest font-medium">
-                      <span className={download.status === 'downloading' ? 'text-blue-400' : download.status === 'error' ? 'text-red-400' : 'text-white/40'}>
-                        {download.status}
-                      </span>
-                      <span className="text-white/50">{typeof download.progress === 'number' ? Math.round(download.progress) : download.progress}%</span>
-                    </div>
-                    <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden shadow-inner">
+                  ) : filteredDownloads.map((download) => {
+                    const isRefreshBlocked = downloadNeedsUrlRefresh(download);
+                    const isActiveDownload = download.status === 'downloading' || download.status === 'queued' || download.status === 'muxing';
+                    const statusClass = download.status === 'downloading'
+                      ? 'text-blue-400'
+                      : isRefreshBlocked
+                        ? 'text-amber-300'
+                        : download.status === 'error'
+                          ? 'text-red-400'
+                          : 'text-white/40';
+                    const progressClass = download.status === 'finished'
+                      ? 'bg-green-500'
+                      : isRefreshBlocked
+                        ? 'bg-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.35)]'
+                        : download.status === 'error'
+                          ? 'bg-red-500'
+                          : 'bg-blue-500 shadow-[0_0_10px_rgba(59,130,246,0.5)]';
+                    return (
                       <motion.div
-                        initial={{ width: 0 }}
-                        animate={{ width: `${download.progress}%` }}
-                        className={`h-full rounded-full ${download.status === 'finished' ? 'bg-green-500' : download.status === 'error' ? 'bg-red-500' : 'bg-blue-500 shadow-[0_0_10px_rgba(59,130,246,0.5)]'}`}
-                      />
-                    </div>
-                  </div>
-                  <div className="data-value">{formatDownloadSpeed(download)}</div>
-                  <div className="relative flex gap-2">
-                    <button
-                      type="button"
-                      onClick={() => void revealDownloadInFolder(download.id)}
-                      disabled={!download.output_path}
-                      className="p-1.5 text-white/40 hover:text-white hover:bg-white/10 rounded-md transition-all disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent"
-                      title="Reveal in folder"
-                    >
-                      <FolderOpen className="w-3.5 h-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void openDownloadFile(download.id)}
-                      disabled={download.status !== 'finished'}
-                      className="p-1.5 text-white/40 hover:text-white hover:bg-white/10 rounded-md transition-all disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent"
-                      title="Open file"
-                    >
-                      <ExternalLink className="w-3.5 h-3.5" />
-                    </button>
-                    <button
-                      onClick={() => void togglePlayPause(download.id, download.status)}
-                      className="p-1.5 text-white/40 hover:text-white hover:bg-white/10 rounded-md transition-all"
-                      title={download.status === 'downloading' || download.status === 'queued' || download.status === 'muxing' ? 'Pause' : download.status === 'error' ? 'Retry' : 'Resume'}
-                    >
-                      {download.status === 'downloading' || download.status === 'queued' || download.status === 'muxing' ? (
-                        <Pause className="w-3.5 h-3.5" />
-                      ) : download.status === 'error' ? (
-                        <RefreshCw className="w-3.5 h-3.5 text-red-500" />
-                      ) : (
-                        <Play className="w-3.5 h-3.5 pl-[1px]" />
-                      )}
-                    </button>
+                        key={download.id}
+                        layout
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, scale: 0.95 }}
+                        onContextMenu={(event) => {
+                          if (!isPopupSurface || !isRefreshBlocked) {
+                            return;
+                          }
+                          event.preventDefault();
+                          setRefreshContextMenu({ id: download.id, x: event.clientX, y: event.clientY });
+                        }}
+                        className={`data-row grid grid-cols-[40px_1fr_120px_180px_120px_160px] gap-4 px-3 py-3 items-center group ${isPopupSurface && isRefreshBlocked ? 'cursor-context-menu' : ''}`}
+                      >
+                        <div className="data-value opacity-40">{typeof download.id === 'number' ? download.id.toString().padStart(2, '0') : download.id.substring(0, 4)}</div>
+                        <div className="flex flex-col min-w-0 pr-4">
+                          <div className="font-medium truncate text-[13px] text-white/90">{download.name || download.filename}</div>
+                          {download.output_path && (
+                            <div className="mt-1 flex items-center gap-1.5 min-w-0">
+                              <div className="truncate text-[10px] font-mono text-white/35" title={download.output_path}>{getDownloadParentDirectory(download.output_path)}</div>
+                              <button
+                                type="button"
+                                onClick={() => void copyPathToClipboard(download.output_path)}
+                                className="flex-none rounded-md p-1 text-white/35 transition-colors hover:bg-white/10 hover:text-white/80"
+                                title="Copy full output path"
+                              >
+                                <Copy className="w-3 h-3" />
+                              </button>
+                            </div>
+                          )}
+                          {isRefreshBlocked && (
+                            <div className="mt-3 rounded-xl border border-amber-400/20 bg-amber-400/10 px-3 py-2.5">
+                              <div className="flex items-start justify-between gap-3">
+                                <div>
+                                  <div className="text-[10px] font-mono uppercase tracking-widest text-amber-100/75">Link expired</div>
+                                  <div className="mt-1 text-xs text-amber-50">Refresh URL to keep your progress.</div>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => openRefreshUrlModal(download)}
+                                  className="rounded-lg border border-amber-300/30 px-2.5 py-1 text-[10px] font-mono uppercase tracking-widest text-amber-100 transition-colors hover:border-amber-200/50 hover:bg-amber-200/10"
+                                >
+                                  Refresh Link
+                                </button>
+                              </div>
+                              {isPopupSurface && (
+                                <div className="mt-2 text-[10px] text-amber-100/70">Right-click row to pull current tab URL.</div>
+                              )}
+                            </div>
+                          )}
+                          {download.status === 'error' && !isRefreshBlocked && (download.error || download.error_code || download.last_attempt_at) && (
+                            <div className="mt-0.5">
+                              {download.error && <div className="text-xs text-red-400 truncate" title={download.error}>{download.error}</div>}
+                              {(download.error_code || download.last_attempt_at) && (
+                                <div className="mt-1 hidden rounded-md border border-red-500/20 bg-red-500/10 px-2.5 py-2 text-[10px] font-mono text-red-200 shadow-lg group-hover:block">
+                                  {download.error_code && <div>Code: {download.error_code}</div>}
+                                  {download.last_attempt_at && <div>Last Attempt: {formatAttemptTimestamp(download.last_attempt_at)}</div>}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                        <div className="data-value">{formatSize((download as any).total_size ?? download.size ?? 0)}</div>
+                        <div className="space-y-2 pr-4">
+                          <div className="flex justify-between text-[10px] uppercase font-mono tracking-widest font-medium">
+                            <span className={statusClass}>
+                              {download.status}
+                            </span>
+                            <span className="text-white/50">{typeof download.progress === 'number' ? Math.round(download.progress) : download.progress}%</span>
+                          </div>
+                          <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden shadow-inner">
+                            <motion.div
+                              initial={{ width: 0 }}
+                              animate={{ width: `${download.progress}%` }}
+                              className={`h-full rounded-full ${progressClass}`}
+                            />
+                          </div>
+                        </div>
+                        <div className="data-value">{formatDownloadSpeed(download)}</div>
+                        <div className="relative flex gap-2">
+                          <button
+                            type="button"
+                            onClick={() => void revealDownloadInFolder(download.id)}
+                            disabled={!download.output_path}
+                            className="p-1.5 text-white/40 hover:text-white hover:bg-white/10 rounded-md transition-all disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent"
+                            title="Reveal in folder"
+                          >
+                            <FolderOpen className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void openDownloadFile(download.id)}
+                            disabled={download.status !== 'finished'}
+                            className="p-1.5 text-white/40 hover:text-white hover:bg-white/10 rounded-md transition-all disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent"
+                            title="Open file"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => void togglePlayPause(download)}
+                            className="p-1.5 text-white/40 hover:text-white hover:bg-white/10 rounded-md transition-all"
+                            title={isActiveDownload ? 'Pause' : isRefreshBlocked ? 'Refresh link' : download.status === 'error' ? 'Retry' : 'Resume'}
+                          >
+                            {isActiveDownload ? (
+                              <Pause className="w-3.5 h-3.5" />
+                            ) : isRefreshBlocked ? (
+                              <RefreshCw className="w-3.5 h-3.5 text-amber-300" />
+                            ) : download.status === 'error' ? (
+                              <RefreshCw className="w-3.5 h-3.5 text-red-500" />
+                            ) : (
+                              <Play className="w-3.5 h-3.5 pl-[1px]" />
+                            )}
+                          </button>
                     <button
                       type="button"
                       onClick={() => setRemovalTarget((current) => current?.id === download.id ? null : { id: download.id, status: download.status })}
@@ -2092,9 +2356,10 @@ export default function App({ surface = 'dashboard' }: AppProps) {
                         </div>
                       </div>
                     )}
-                  </div>
-                    </motion.div>
-                  ))}
+                        </div>
+                      </motion.div>
+                    );
+                  })}
                 </div>
               </AnimatePresence>
             </>
@@ -2122,6 +2387,157 @@ export default function App({ surface = 'dashboard' }: AppProps) {
           <div>Active Connections: {activeConnections}</div>
         </footer>
       </main>
+
+    <AnimatePresence>
+      {refreshContextMenu && (() => {
+        const refreshTarget = downloads.find((download) => download.id === refreshContextMenu.id);
+        if (!refreshTarget) {
+          return null;
+        }
+        return (
+          <div className="fixed inset-0 z-40" onClick={() => setRefreshContextMenu(null)} onContextMenu={(event) => { event.preventDefault(); setRefreshContextMenu(null); }}>
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96, y: -4 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.96, y: -4 }}
+              onClick={(event) => event.stopPropagation()}
+              className="absolute min-w-64 rounded-xl border border-white/10 bg-[#111111] p-2 shadow-2xl"
+              style={{ left: refreshContextMenu.x, top: refreshContextMenu.y }}
+            >
+              <button
+                type="button"
+                onClick={() => void loadCurrentTabUrlIntoRefreshModal(refreshTarget)}
+                disabled={!isExtensionRuntimeAvailable()}
+                className="w-full rounded-lg px-3 py-2 text-left text-[11px] font-mono uppercase tracking-widest text-white/80 transition-colors hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Refresh URL From Current Tab
+              </button>
+            </motion.div>
+          </div>
+        );
+      })()}
+    </AnimatePresence>
+
+    <AnimatePresence>
+      {refreshUrlDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={closeRefreshUrlModal} className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
+          <motion.div
+            initial={{ opacity: 0, scale: 0.94, y: 16 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.94, y: 16 }}
+            className="relative w-full max-w-xl rounded-2xl border border-white/10 bg-[#141414] p-8 shadow-2xl"
+          >
+            <h2 className="flex items-center gap-2 text-xl font-bold text-white">
+              <RefreshCw className="h-5 w-5 text-amber-300" /> Refresh Download Link
+            </h2>
+            <div className="mt-6 space-y-4">
+              <div className="rounded-2xl border border-amber-400/20 bg-amber-400/10 p-4">
+                <div className="text-[10px] font-mono uppercase tracking-widest text-amber-100/75">Expired Link</div>
+                <div className="mt-2 text-sm font-medium text-amber-50">{refreshUrlDialog.label}</div>
+                <p className="mt-2 text-xs leading-6 text-amber-100/80">
+                  Paste fresh signed URL. Host keeps completed bytes when size and validators still match.
+                </p>
+              </div>
+
+              <div>
+                <label className="mb-2 block text-[10px] font-mono uppercase tracking-widest text-white/50">New URL</label>
+                <input
+                  autoFocus
+                  type="text"
+                  value={refreshUrlInput}
+                  onChange={(event) => setRefreshUrlInput(event.target.value)}
+                  placeholder="https://example.com/signed/file.bin"
+                  className="w-full rounded-xl border border-white/10 bg-[#0A0A0A] px-4 py-3 font-mono text-[13px] text-white focus:border-white/30 focus:outline-none"
+                />
+                {refreshUrlDialog.currentUrl && (
+                  <p className="mt-2 truncate text-[10px] font-mono text-white/35" title={refreshUrlDialog.currentUrl}>
+                    Current stored URL: {refreshUrlDialog.currentUrl}
+                  </p>
+                )}
+              </div>
+
+              {refreshUrlError && (
+                <div className={`rounded-xl border px-3 py-3 text-sm ${refreshUrlMismatch ? 'border-amber-400/20 bg-amber-400/10 text-amber-100' : 'border-red-500/20 bg-red-500/10 text-red-200'}`}>
+                  <div className="font-medium">{refreshUrlMismatch ? formatRefreshIssueTitle(refreshUrlMismatch.code) : 'Refresh failed'}</div>
+                  <div className="mt-1 text-xs leading-6">{refreshUrlError}</div>
+                </div>
+              )}
+
+              {refreshUrlMismatch?.details && Object.entries(refreshUrlMismatch.details).length > 0 && (
+                <div className="rounded-xl border border-white/10 bg-black/20 p-4">
+                  <div className="text-[10px] font-mono uppercase tracking-widest text-white/40">Mismatch Details</div>
+                  <div className="mt-3 grid gap-2 text-xs text-white/75">
+                    {Object.entries(refreshUrlMismatch.details).map(([key, value]) => (
+                      <div key={key} className="flex items-center justify-between gap-4">
+                        <span className="text-white/45">{formatRefreshDetailLabel(key)}</span>
+                        <span className="max-w-[60%] truncate font-mono text-right text-white/90" title={formatRefreshDetailValue(key, value)}>
+                          {formatRefreshDetailValue(key, value)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="flex flex-wrap gap-3 pt-2">
+                <button onClick={closeRefreshUrlModal} className="rounded-xl border border-white/10 px-5 py-3 text-white/70 transition-colors hover:bg-white/5">
+                  Cancel
+                </button>
+                {isExtensionRuntimeAvailable() && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const download = downloads.find((candidate) => candidate.id === refreshUrlDialog.id);
+                      if (download) {
+                        void loadCurrentTabUrlIntoRefreshModal(download);
+                      }
+                    }}
+                    disabled={isLoadingCurrentTabUrl || isRefreshingUrl}
+                    className="rounded-xl border border-white/10 px-5 py-3 text-white/75 transition-colors hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {isLoadingCurrentTabUrl ? 'Pulling Current Tab...' : 'Use Current Tab URL'}
+                  </button>
+                )}
+                {refreshUrlMismatch && canForceRefreshWithoutValidators(refreshUrlMismatch.code) && (
+                  <button
+                    type="button"
+                    onClick={() => void submitRefreshDownloadUrl({ force: true })}
+                    disabled={isRefreshingUrl}
+                    className="rounded-xl border border-amber-300/30 px-5 py-3 text-amber-100 transition-colors hover:bg-amber-300/10 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    Continue Anyway
+                  </button>
+                )}
+                {refreshUrlMismatch && canRestartRefreshFromScratch(refreshUrlMismatch.code) && (
+                  <button
+                    type="button"
+                    onClick={() => void submitRefreshDownloadUrl({ force: true, restartFromScratch: true })}
+                    disabled={isRefreshingUrl}
+                    className="rounded-xl border border-red-500/30 px-5 py-3 text-red-200 transition-colors hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    Restart From Scratch
+                  </button>
+                )}
+                <button
+                  onClick={() => void submitRefreshDownloadUrl()}
+                  disabled={isRefreshingUrl}
+                  className="flex-1 rounded-xl bg-white px-5 py-3 font-medium text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:bg-white/20 disabled:text-white/40"
+                >
+                  {isRefreshingUrl ? 'Refreshing Link...' : 'Refresh Link'}
+                </button>
+              </div>
+
+              {isPopupSurface && (
+                <p className="text-[10px] font-mono uppercase tracking-widest text-white/35">
+                  Popup shortcut: right-click expired row to pull active-tab URL.
+                </p>
+              )}
+            </div>
+          </motion.div>
+        </div>
+      )}
+    </AnimatePresence>
 
       <AnimatePresence>
         {isAdding && (

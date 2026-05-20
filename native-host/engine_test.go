@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -1155,6 +1156,271 @@ func TestEngineResumeRemoteChangeSizeMismatchFails(t *testing.T) {
 	}
 }
 
+func TestEngineDownloadMarksAwaitingURLRefreshOnExpiredLink(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	var attempts atomic.Int32
+	logBuffer := setTestLogger(t, slog.LevelWarn)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"expired-link"`)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "4096")
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		attempts.Add(1)
+		http.Error(w, "expired", http.StatusForbidden)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{URL: server.URL + "/expired.bin", Filename: "expired.bin", Segments: 1})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if err := engine.Start(state.ID); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+
+	final := waitForTerminalStateWithin(t, storage, state.ID, 5*time.Second)
+	if final.Status != "awaiting_url_refresh" {
+		t.Fatalf("expected awaiting_url_refresh status, got %q (%s)", final.Status, final.Error)
+	}
+	if final.ErrorCode != "url_expired" {
+		t.Fatalf("expected url_expired error code, got %q", final.ErrorCode)
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("expected expired link to stop after one attempt, got %d", attempts.Load())
+	}
+	if !strings.Contains(logBuffer.String(), "event=url_expired") {
+		t.Fatalf("expected url_expired log entry, got logs: %s", logBuffer.String())
+	}
+}
+
+func TestEngineRefreshURLResumesExpiredDownload(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	body := []byte(strings.Repeat("refresh-resume-", 128))
+	digest := md5.Sum(body)
+	etag := `"refresh-match"`
+	partialBytes := int64(len(body) / 3)
+	var sawIfRange atomic.Bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", etag)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Header.Get("Range") != "" {
+			if r.Header.Get("If-Range") != etag {
+				http.Error(w, "missing If-Range", http.StatusPreconditionFailed)
+				return
+			}
+			sawIfRange.Store(true)
+		}
+		handleRangeResponse(w, r, body, digest)
+	}))
+	defer server.Close()
+
+	outputPath := filepath.Join(t.TempDir(), "refresh-resume.bin")
+	writePartialDownloadFile(t, outputPath, body[:partialBytes])
+	state := &DownloadState{
+		ID:             "refresh-url-resume",
+		URL:            "https://expired.example.test/file.bin",
+		Filename:       filepath.Base(outputPath),
+		OutputPath:     outputPath,
+		TotalSize:      int64(len(body)),
+		TotalSizeAtAdd: int64(len(body)),
+		Status:         "awaiting_url_refresh",
+		Type:           "file",
+		CreatedAt:      time.Now(),
+		Error:          "Link expired. Refresh URL to keep your progress.",
+		ErrorCode:      "url_expired",
+		ETag:           etag,
+		Segments: []Segment{{
+			Index:   0,
+			Start:   0,
+			End:     int64(len(body)) - 1,
+			Current: partialBytes,
+		}},
+	}
+	if err := storage.SaveDownload(state); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+
+	updated, err := engine.RefreshURL(state.ID, server.URL+"/file.bin", false, false)
+	if err != nil {
+		t.Fatalf("RefreshURL returned error: %v", err)
+	}
+	if updated.URL != server.URL+"/file.bin" {
+		t.Fatalf("expected refreshed URL %q, got %q", server.URL+"/file.bin", updated.URL)
+	}
+
+	final := waitForTerminalStateWithin(t, storage, state.ID, 5*time.Second)
+	if final.Status != "finished" {
+		t.Fatalf("expected finished download after refresh, got %q (%s)", final.Status, final.Error)
+	}
+	if final.ErrorCode != "" || final.Error != "" {
+		t.Fatalf("expected refresh to clear error state, got code=%q error=%q", final.ErrorCode, final.Error)
+	}
+	if !sawIfRange.Load() {
+		t.Fatal("expected resumed refresh download to include If-Range")
+	}
+
+	downloaded, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if !bytes.Equal(downloaded, body) {
+		t.Fatal("expected refreshed resume file to match source body")
+	}
+}
+
+func TestEngineRefreshURLReturnsETagMismatchDetails(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	body := []byte(strings.Repeat("etag-mismatch-", 64))
+	newETag := `"etag-new"`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", newETag)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Error(w, "unexpected body request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	state := &DownloadState{
+		ID:             "refresh-url-etag-mismatch",
+		URL:            "https://expired.example.test/file.bin",
+		Filename:       "etag-mismatch.bin",
+		OutputPath:     filepath.Join(t.TempDir(), "etag-mismatch.bin"),
+		TotalSize:      int64(len(body)),
+		TotalSizeAtAdd: int64(len(body)),
+		Status:         "awaiting_url_refresh",
+		Type:           "file",
+		CreatedAt:      time.Now(),
+		ErrorCode:      "url_expired",
+		ETag:           `"etag-old"`,
+		Segments: []Segment{{
+			Index: 0,
+			Start: 0,
+			End:   int64(len(body)) - 1,
+		}},
+	}
+	if err := storage.SaveDownload(state); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+
+	_, err := engine.RefreshURL(state.ID, server.URL+"/file.bin", false, false)
+	if err == nil {
+		t.Fatal("expected RefreshURL to fail on etag mismatch")
+	}
+	var coded *codedError
+	if !errors.As(err, &coded) {
+		t.Fatalf("expected codedError, got %T", err)
+	}
+	if coded.Code != "etag_mismatch" {
+		t.Fatalf("expected etag_mismatch code, got %q", coded.Code)
+	}
+	details, ok := coded.Payload.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected mismatch details payload, got %#v", coded.Payload)
+	}
+	if details["oldETag"] != `"etag-old"` || details["newETag"] != newETag {
+		t.Fatalf("expected old/new etag details, got %#v", details)
+	}
+
+	persisted, err := storage.GetDownload(state.ID)
+	if err != nil {
+		t.Fatalf("GetDownload returned error: %v", err)
+	}
+	if persisted.Status != "awaiting_url_refresh" {
+		t.Fatalf("expected state to remain awaiting_url_refresh, got %q", persisted.Status)
+	}
+	if persisted.URL != state.URL {
+		t.Fatalf("expected state URL to remain %q, got %q", state.URL, persisted.URL)
+	}
+}
+
+func TestEngineRefreshURLRestartsFromScratchOnSizeMismatch(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	oldBody := []byte(strings.Repeat("old-size-", 96))
+	newBody := []byte(strings.Repeat("new-size-", 144))
+	newDigest := md5.Sum(newBody)
+	partialBytes := int64(len(oldBody) / 2)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"refresh-size-new"`)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(newBody)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		handleRangeResponse(w, r, newBody, newDigest)
+	}))
+	defer server.Close()
+
+	outputPath := filepath.Join(t.TempDir(), "refresh-restart.bin")
+	writePartialDownloadFile(t, outputPath, oldBody[:partialBytes])
+	state := &DownloadState{
+		ID:             "refresh-url-restart",
+		URL:            "https://expired.example.test/file.bin",
+		Filename:       filepath.Base(outputPath),
+		OutputPath:     outputPath,
+		TotalSize:      int64(len(oldBody)),
+		TotalSizeAtAdd: int64(len(oldBody)),
+		Status:         "awaiting_url_refresh",
+		Type:           "file",
+		CreatedAt:      time.Now(),
+		ErrorCode:      "url_expired",
+		ETag:           `"refresh-size-old"`,
+		Segments: []Segment{{
+			Index:   0,
+			Start:   0,
+			End:     int64(len(oldBody)) - 1,
+			Current: partialBytes,
+		}},
+	}
+	if err := storage.SaveDownload(state); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+
+	updated, err := engine.RefreshURL(state.ID, server.URL+"/file.bin", true, true)
+	if err != nil {
+		t.Fatalf("RefreshURL returned error: %v", err)
+	}
+	if updated.TotalSizeAtAdd != int64(len(newBody)) {
+		t.Fatalf("expected refreshed size snapshot %d, got %d", len(newBody), updated.TotalSizeAtAdd)
+	}
+
+	final := waitForTerminalStateWithin(t, storage, state.ID, 5*time.Second)
+	if final.Status != "finished" {
+		t.Fatalf("expected forced refresh restart to finish, got %q (%s)", final.Status, final.Error)
+	}
+	if final.TotalSize != int64(len(newBody)) {
+		t.Fatalf("expected total size updated to %d, got %d", len(newBody), final.TotalSize)
+	}
+
+	downloaded, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if !bytes.Equal(downloaded, newBody) {
+		t.Fatal("expected forced refresh restart to redownload new body")
+	}
+}
+
 func TestEngineResumeRangeNotSatisfiableRetriesFromSegmentStart(t *testing.T) {
 	storage := newTestStorage(t)
 	engine := NewEngine(storage, nil)
@@ -1376,7 +1642,7 @@ func waitForTerminalStateWithin(t *testing.T, storage *Storage, id string, timeo
 		state, err := storage.GetDownload(id)
 		if err == nil {
 			switch state.Status {
-			case "finished", "error", "paused":
+			case "finished", "error", "paused", "awaiting_url_refresh":
 				return *state
 			}
 		}

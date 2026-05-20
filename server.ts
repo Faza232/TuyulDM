@@ -37,9 +37,10 @@ async function startServer() {
 
   // Mock Native Host API for the preview
   const activeDownloads = [
-    { id: 1, name: "ubuntu-24.04-desktop-amd64.iso", output_path: "/home/faza/Downloads/ubuntu-24.04-desktop-amd64.iso", size: "4.7 GB", progress: 45, speed: "12.4 MB/s", status: "downloading", type: "file" },
-    { id: 2, name: "TuyulDM_Source.zip", output_path: "/home/faza/Downloads/TuyulDM_Source.zip", size: "120 MB", progress: 100, speed: "0 B/s", status: "finished", type: "file" },
-    { id: 3, name: "Presentation_Video_HLS.mp4", output_path: "/home/faza/Downloads/Presentation_Video_HLS.mp4", size: "890 MB", progress: 12, speed: "2.1 MB/s", status: "downloading", type: "video" },
+    { id: 1, name: "ubuntu-24.04-desktop-amd64.iso", url: "https://releases.example.test/ubuntu.iso", output_path: "/home/faza/Downloads/ubuntu-24.04-desktop-amd64.iso", size: "4.7 GB", progress: 45, speed: "12.4 MB/s", status: "downloading", type: "file" },
+    { id: 2, name: "TuyulDM_Source.zip", url: "https://github.example.test/TuyulDM_Source.zip", output_path: "/home/faza/Downloads/TuyulDM_Source.zip", size: "120 MB", progress: 100, speed: "0 B/s", status: "finished", type: "file" },
+    { id: 3, name: "Presentation_Video_HLS.mp4", url: "https://video.example.test/hls/master.m3u8", output_path: "/home/faza/Downloads/Presentation_Video_HLS.mp4", size: "890 MB", progress: 12, speed: "2.1 MB/s", status: "downloading", type: "video" },
+    { id: 4, name: "signed-asset.bin", url: "https://cdn.example.test/signed-asset.bin?token=expired", output_path: "/home/faza/Downloads/signed-asset.bin", size: "860 MB", progress: 61, speed: "0 B/s", status: "awaiting_url_refresh", type: "file", error: "Link expired. Refresh URL to keep your progress.", error_code: "url_expired" },
   ];
 
   app.get("/api/host-status", (_req, res) => {
@@ -81,6 +82,45 @@ async function startServer() {
     const id = parseInt(req.params.id, 10);
     const action = req.params.action; // "pause" or "resume"
     const dl = activeDownloads.find(d => d.id === id);
+    if (action === "refresh-url") {
+      if (!dl) {
+        res.status(404).json({ error: "download not found" });
+        return;
+      }
+
+      const nextUrl = String(req.body?.url || "").trim();
+      const force = !!req.body?.force;
+      const restartFromScratch = !!req.body?.restartFromScratch;
+      if (!nextUrl) {
+        res.status(400).json({ error: "url is required" });
+        return;
+      }
+      if (!force && nextUrl.includes("mismatch")) {
+        res.status(409).json({
+          error: "Preview mismatch: new URL points to different file size.",
+          code: "size_mismatch",
+          details: { expectedTotalSize: 860 * 1024 ** 2, actualTotalSize: 912 * 1024 ** 2 },
+        });
+        return;
+      }
+      if (!force && nextUrl.includes("validators-missing")) {
+        res.status(409).json({
+          error: "Preview warning: new URL no longer exposes validators.",
+          code: "validators_missing",
+        });
+        return;
+      }
+
+      dl.url = nextUrl;
+      dl.error = undefined;
+      dl.error_code = undefined;
+      dl.status = "downloading";
+      dl.speed = "9.8 MB/s";
+      dl.progress = restartFromScratch ? 0 : Math.max(Number(dl.progress || 0), 61);
+      res.json({ ok: true, download: dl });
+      return;
+    }
+
     if (dl) {
       if (action === "pause") {
         dl.status = "paused";

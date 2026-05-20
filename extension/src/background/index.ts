@@ -906,7 +906,14 @@ function handleHostResponse(response: any) {
     pendingRequests.delete(response.id);
 
     if (response.status === 'error') {
-      pendingRequest.reject(new Error(response.message || 'Native host request failed'));
+        const hostError = new Error(response.message || 'Native host request failed') as Error & { code?: string; payload?: any };
+        if (response?.payload && typeof response.payload === 'object') {
+          hostError.payload = response.payload;
+          if (typeof response.payload.code === 'string') {
+            hostError.code = response.payload.code;
+          }
+        }
+        pendingRequest.reject(hostError);
     } else {
       pendingRequest.resolve(response);
     }
@@ -949,6 +956,23 @@ function rejectPendingRequests(message: string) {
     reject(new Error(message));
   }
   pendingRequests.clear();
+}
+
+function serializeRuntimeError(error: unknown) {
+  const hostError = error as { code?: string; payload?: any } | null;
+  const payload = hostError && typeof hostError === 'object' ? hostError.payload : undefined;
+  const details = payload && typeof payload === 'object' && 'details' in payload ? payload.details : undefined;
+  const code = typeof hostError?.code === 'string'
+    ? hostError.code
+    : payload && typeof payload === 'object' && typeof payload.code === 'string'
+      ? payload.code
+      : undefined;
+  return {
+    error: error instanceof Error ? error.message : String(error),
+    code,
+    details,
+    status: hostStatus,
+  };
 }
 
 function connectToHost() {
@@ -1245,6 +1269,13 @@ browserApi.runtime.onMessage.addListener(((message: any, sender: any, sendRespon
     return true;
   }
 
+	if (message.type === 'GET_ACTIVE_TAB_URL') {
+		getActiveTab()
+			.then((tab) => sendResponse({ url: typeof tab?.url === 'string' ? tab.url : '' }))
+			.catch((error) => sendResponse({ error: String(error), url: '' }));
+		return true;
+	}
+
   if (message.type === 'SCAN_PAGE' || message.type === 'SCAN_PAGE_VIDEOS') {
     getActiveTab()
       .then(async (tab) => {
@@ -1411,6 +1442,18 @@ browserApi.runtime.onMessage.addListener(((message: any, sender: any, sendRespon
   if (message.type === 'RESUME_DOWNLOAD') {
     void sendHostRequest('download.resume', { id: String(message.id) }).catch((error) => console.error('Failed to resume download:', error));
     return false;
+  }
+
+  if (message.type === 'REFRESH_DOWNLOAD_URL') {
+    sendHostRequest('download.refreshUrl', {
+      id: String(message.id),
+      url: String(message.url || ''),
+      force: !!message.force,
+      restartFromScratch: !!message.restartFromScratch,
+    })
+      .then((response) => sendResponse({ ok: true, download: response.payload, status: hostStatus }))
+      .catch((error) => sendResponse(serializeRuntimeError(error)));
+    return true;
   }
 
   if (message.type === 'REMOVE_DOWNLOAD') {

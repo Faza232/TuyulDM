@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -34,6 +35,20 @@ type HostStatsPayload struct {
 type readLoopResult struct {
 	payload []byte
 	err     error
+}
+
+func errorResponsePayload(err error) interface{} {
+	var coded *codedError
+	if !errors.As(err, &coded) {
+		return nil
+	}
+	payload := map[string]interface{}{
+		"code": coded.Code,
+	}
+	if coded.Payload != nil {
+		payload["details"] = coded.Payload
+	}
+	return payload
 }
 
 func main() {
@@ -225,6 +240,27 @@ func main() {
 				resp.Message = err.Error()
 			} else {
 				resp.Status = "ok"
+			}
+		case "download.refreshUrl":
+			var params struct {
+				ID                 string `json:"id"`
+				URL                string `json:"url"`
+				Force              bool   `json:"force,omitempty"`
+				RestartFromScratch bool   `json:"restartFromScratch,omitempty"`
+			}
+			if err := decodeParams(req, &params); err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				break
+			}
+			state, err := engine.RefreshURL(params.ID, params.URL, params.Force, params.RestartFromScratch)
+			if err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				resp.Payload = errorResponsePayload(err)
+			} else {
+				resp.Status = "ok"
+				resp.Payload = state
 			}
 		case "download.remove":
 			var params struct {

@@ -100,8 +100,9 @@ func (e *statusCodeError) Error() string {
 }
 
 type codedError struct {
-	Code string
-	Err  error
+	Code    string
+	Payload interface{}
+	Err     error
 }
 
 type rangeResumeResetError struct {
@@ -117,8 +118,21 @@ type remoteChangeRecoveryError struct {
 	ContentLength int64
 }
 
+type urlExpiredError struct {
+	SegmentIndex int
+	StatusCode   int
+	Reason       string
+}
+
 func (e *remoteChangeRecoveryError) Error() string {
 	return fmt.Sprintf("segment %d remote changed during resume", e.SegmentIndex)
+}
+
+func (e *urlExpiredError) Error() string {
+	if strings.TrimSpace(e.Reason) != "" {
+		return e.Reason
+	}
+	return fmt.Sprintf("segment %d download link expired", e.SegmentIndex)
 }
 
 func (e *codedError) Error() string {
@@ -133,10 +147,14 @@ func (e *codedError) Unwrap() error {
 }
 
 func withErrorCode(code string, err error) error {
+	return withErrorPayload(code, nil, err)
+}
+
+func withErrorPayload(code string, payload interface{}, err error) error {
 	if err == nil {
 		return nil
 	}
-	return &codedError{Code: code, Err: err}
+	return &codedError{Code: code, Payload: payload, Err: err}
 }
 
 func preferredResumeValidator(state *DownloadState) string {
@@ -165,6 +183,14 @@ func setDownloadFailureState(state *DownloadState, err error) {
 	setDownloadSpeed(state, 0)
 	state.Error = err.Error()
 	noteDownloadAttempt(state, err)
+}
+
+func setDownloadAwaitingURLRefresh(state *DownloadState, message string) {
+	state.Status = "awaiting_url_refresh"
+	setDownloadSpeed(state, 0)
+	state.Error = message
+	state.ErrorCode = "url_expired"
+	state.LastAttemptAt = time.Now().UTC()
 }
 
 func setDownloadSpeed(state *DownloadState, bytesPerSecond int64) {
@@ -200,6 +226,45 @@ func downloadErrorCode(err error) string {
 	}
 
 	return "download_failed"
+}
+
+func statusAllowsURLRefresh(state *DownloadState) bool {
+	if state == nil {
+		return false
+	}
+	if state.Status == "awaiting_url_refresh" || state.Status == "paused" {
+		return true
+	}
+	return state.Status == "error" && state.ErrorCode == "url_expired"
+}
+
+func refreshURLExpectedSize(state *DownloadState) int64 {
+	if state == nil {
+		return 0
+	}
+	if state.TotalSizeAtAdd > 0 {
+		return state.TotalSizeAtAdd
+	}
+	return state.TotalSize
+}
+
+func requestedSegmentsForState(state *DownloadState) int {
+	if state == nil || len(state.Segments) == 0 {
+		return defaultSegments
+	}
+	return len(state.Segments)
+}
+
+func isHTMLAssetResponse(stateURL string, resp *http.Response, rangeRequested bool) bool {
+	contentType := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+	if !strings.Contains(contentType, "text/html") {
+		return false
+	}
+	if rangeRequested {
+		return true
+	}
+	lowerURL := strings.ToLower(strings.TrimSpace(stateURL))
+	return !strings.HasSuffix(lowerURL, ".html") && !strings.HasSuffix(lowerURL, ".htm")
 }
 
 func segmentRetryLogAttrs(snapshot DownloadState, idx int, requestURL string, attempt int, err error, delay time.Duration) []any {
@@ -635,6 +700,26 @@ func (e *Engine) runDownload(a *ActiveDownload) {
 	close(done)
 	_ = file.Sync()
 
+	var expiredErr *urlExpiredError
+	if errors.As(lastError, &expiredErr) {
+		e.releaseActiveSlot(a.State.ID)
+
+		a.mu.Lock()
+		setDownloadAwaitingURLRefresh(a.State, "Link expired. Refresh URL to keep your progress.")
+		snapshot := cloneDownloadState(a.State)
+		a.mu.Unlock()
+
+		slog.Warn("download awaiting refreshed url",
+			"download_id", snapshot.ID,
+			"url", snapshot.URL,
+			"segment_index", expiredErr.SegmentIndex,
+			"status_code", expiredErr.StatusCode,
+			"event", "url_expired",
+		)
+		e.persistSnapshot(snapshot)
+		return
+	}
+
 	var remoteRecoveryErr *remoteChangeRecoveryError
 	if errors.As(lastError, &remoteRecoveryErr) {
 		e.releaseActiveSlot(a.State.ID)
@@ -761,6 +846,7 @@ func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int, attempt int)
 	seg := a.State.Segments[idx]
 	downloadID := a.State.ID
 	stateURL := a.State.URL
+	filename := a.State.Filename
 	totalSize := a.State.TotalSize
 	headers := cloneStringMap(a.State.Headers)
 	cookies := append([]RequestCookie(nil), a.State.Cookies...)
@@ -810,6 +896,31 @@ func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int, attempt int)
 	stallReader := newStallWatchReader(reqCtx, resp.Body, cancel, stallTimeout)
 	defer stallReader.Stop()
 	reader := newThrottledReader(reqCtx, stallReader, &a.PerDownloadLimiter, e.globalLimiterSnapshot())
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusGone {
+		reason := fmt.Sprintf("segment request returned status %d", resp.StatusCode)
+		slog.Warn("segment detected expired url",
+			"download_id", downloadID,
+			"url", stateURL,
+			"filename", filename,
+			"segment_index", idx,
+			"status_code", resp.StatusCode,
+			"event", "url_expired",
+		)
+		return &urlExpiredError{SegmentIndex: idx, StatusCode: resp.StatusCode, Reason: reason}
+	}
+	if isHTMLAssetResponse(stateURL, resp, rangeRequested) {
+		slog.Warn("segment detected html login or error page",
+			"download_id", downloadID,
+			"url", stateURL,
+			"filename", filename,
+			"segment_index", idx,
+			"status_code", resp.StatusCode,
+			"content_type", resp.Header.Get("Content-Type"),
+			"event", "url_expired",
+		)
+		return &urlExpiredError{SegmentIndex: idx, StatusCode: resp.StatusCode, Reason: "segment request returned html login or error page"}
+	}
 
 	switch {
 	case rangeRequested && resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
@@ -1102,6 +1213,130 @@ func (e *Engine) Resume(id string) error {
 	}
 
 	return e.Start(id)
+}
+
+func (e *Engine) RefreshURL(id string, newURL string, force bool, restartFromScratch bool) (*DownloadState, error) {
+	trimmedURL := strings.TrimSpace(newURL)
+	if trimmedURL == "" {
+		return nil, fmt.Errorf("url is required")
+	}
+
+	state, err := e.storage.GetDownload(id)
+	if err != nil {
+		return nil, err
+	}
+	if !statusAllowsURLRefresh(state) {
+		return nil, fmt.Errorf("download must be awaiting url refresh, paused, or expired")
+	}
+
+	probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	meta, err := e.probeDownload(probeCtx, trimmedURL, cloneStringMap(state.Headers), append([]RequestCookie(nil), state.Cookies...))
+	if err != nil {
+		return nil, err
+	}
+
+	expectedSize := refreshURLExpectedSize(state)
+	if !restartFromScratch && expectedSize > 0 && meta.TotalSize > 0 && meta.TotalSize != expectedSize {
+		return nil, withErrorPayload("size_mismatch", map[string]interface{}{
+			"expectedTotalSize": expectedSize,
+			"actualTotalSize":   meta.TotalSize,
+		}, fmt.Errorf("refreshed url points to different size: expected %d, got %d", expectedSize, meta.TotalSize))
+	}
+	if !restartFromScratch && !meta.AcceptRanges {
+		return nil, withErrorPayload("accept_ranges_required", map[string]interface{}{
+			"acceptRanges": false,
+		}, fmt.Errorf("refreshed url does not support ranged resume"))
+	}
+
+	if state.ETag != "" {
+		switch {
+		case meta.ETag != "" && meta.ETag != state.ETag && !force:
+			return nil, withErrorPayload("etag_mismatch", map[string]interface{}{
+				"oldETag": state.ETag,
+				"newETag": meta.ETag,
+			}, fmt.Errorf("refreshed url points to a different etag"))
+		case meta.ETag == "" && !force && !restartFromScratch:
+			return nil, withErrorPayload("validators_missing", map[string]interface{}{
+				"oldETag":         state.ETag,
+				"newLastModified": meta.LastModified,
+			}, fmt.Errorf("refreshed url no longer exposes validators"))
+		}
+	} else if state.LastModified != "" {
+		switch {
+		case meta.LastModified != "" && meta.LastModified != state.LastModified && !force:
+			return nil, withErrorPayload("last_modified_mismatch", map[string]interface{}{
+				"oldLastModified": state.LastModified,
+				"newLastModified": meta.LastModified,
+			}, fmt.Errorf("refreshed url points to a different last-modified value"))
+		case meta.LastModified == "" && !force && !restartFromScratch:
+			return nil, withErrorPayload("validators_missing", map[string]interface{}{
+				"oldLastModified": state.LastModified,
+				"newETag":         meta.ETag,
+			}, fmt.Errorf("refreshed url no longer exposes validators"))
+		}
+	} else if !meta.hasValidators() && !force && !restartFromScratch {
+		return nil, withErrorPayload("validators_missing", nil, fmt.Errorf("refreshed url is missing validators"))
+	}
+
+	if force || restartFromScratch {
+		slog.Warn("download refresh forced",
+			"download_id", state.ID,
+			"url", meta.FinalURL,
+			"event", "url_refresh_forced",
+			"restart_from_scratch", restartFromScratch,
+		)
+	}
+
+	if restartFromScratch {
+		if err := removeDownloadOutputFile(state); err != nil {
+			return nil, err
+		}
+		resetSegmentsForRetry(state)
+		state.Progress = 0
+		state.TotalSize = meta.TotalSize
+		state.TotalSizeAtAdd = meta.TotalSize
+		state.Segments = buildSegments(meta.TotalSize, requestedSegmentsForState(state), meta.AcceptRanges)
+	}
+
+	if !restartFromScratch {
+		if expectedSize > 0 {
+			state.TotalSize = expectedSize
+		} else {
+			state.TotalSize = meta.TotalSize
+		}
+		if state.TotalSizeAtAdd <= 0 {
+			state.TotalSizeAtAdd = refreshURLExpectedSize(state)
+		}
+	}
+
+	state.URL = meta.FinalURL
+	state.ContentMD5 = meta.ContentMD5
+	state.Digest = meta.Digest
+	state.ETag = meta.ETag
+	state.LastModified = meta.LastModified
+	state.ProbedAt = time.Now().UTC()
+	state.Status = "paused"
+	state.Error = ""
+	state.ErrorCode = ""
+	state.LastAttemptAt = time.Time{}
+	state.WasUserPaused = false
+	setDownloadSpeed(state, 0)
+
+	if err := e.storage.SaveDownload(state); err != nil {
+		return nil, err
+	}
+	if err := e.Resume(state.ID); err != nil {
+		return nil, err
+	}
+
+	updated, err := e.storage.GetDownload(state.ID)
+	if err != nil {
+		clone := cloneDownloadState(state)
+		return &clone, nil
+	}
+	return updated, nil
 }
 
 func shouldResetSegmentsOnResume(state *DownloadState) bool {
