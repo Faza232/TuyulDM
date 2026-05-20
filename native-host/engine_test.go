@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -442,6 +443,275 @@ func TestEngineDownloadRetriesAfterNetworkStall(t *testing.T) {
 	}
 	if !bytes.Equal(downloaded, body) {
 		t.Fatal("expected stalled download to recover and match source body")
+	}
+}
+
+func TestNewActiveDownloadHTTPClientSeedsSegmentURLCookiesAndTunesTransport(t *testing.T) {
+	state := &DownloadState{
+		URL: "https://example.test/file.bin",
+		Cookies: []RequestCookie{{
+			Name:  "session",
+			Value: "ok",
+			Path:  "/",
+		}},
+		Segments: []Segment{{
+			Index: 0,
+			URL:   "https://example.test/video/segment-1.m4s",
+		}},
+	}
+
+	client, err := newActiveDownloadHTTPClient(state)
+	if err != nil {
+		t.Fatalf("newActiveDownloadHTTPClient returned error: %v", err)
+	}
+	t.Cleanup(client.CloseIdleConnections)
+
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport, got %T", client.Transport)
+	}
+	if transport.MaxIdleConns != 64 {
+		t.Fatalf("expected MaxIdleConns=64, got %d", transport.MaxIdleConns)
+	}
+	if transport.MaxIdleConnsPerHost != 32 {
+		t.Fatalf("expected MaxIdleConnsPerHost=32, got %d", transport.MaxIdleConnsPerHost)
+	}
+	if transport.MaxConnsPerHost != 32 {
+		t.Fatalf("expected MaxConnsPerHost=32, got %d", transport.MaxConnsPerHost)
+	}
+	if !transport.ForceAttemptHTTP2 {
+		t.Fatal("expected ForceAttemptHTTP2 to be enabled")
+	}
+	if !transport.DisableCompression {
+		t.Fatal("expected DisableCompression to be enabled")
+	}
+
+	segmentURL, err := url.Parse(state.Segments[0].URL)
+	if err != nil {
+		t.Fatalf("url.Parse returned error: %v", err)
+	}
+	jarCookies := client.Jar.Cookies(segmentURL)
+	if len(jarCookies) != 1 || jarCookies[0].Name != "session" || jarCookies[0].Value != "ok" {
+		t.Fatalf("expected seeded session cookie for segment url, got %#v", jarCookies)
+	}
+}
+
+func TestOpenDownloadOutputFilePreallocatesAndPreservesPartialData(t *testing.T) {
+	outputPath := filepath.Join(t.TempDir(), "preallocated.bin")
+	prefix := []byte("partial-progress")
+	if err := os.WriteFile(outputPath, prefix, 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	state := &DownloadState{
+		OutputPath: outputPath,
+		TotalSize:  4096,
+	}
+	file, err := openDownloadOutputFile(state)
+	if err != nil {
+		t.Fatalf("openDownloadOutputFile returned error: %v", err)
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatalf("Stat returned error: %v", err)
+	}
+	if info.Size() != state.TotalSize {
+		t.Fatalf("expected preallocated size %d, got %d", state.TotalSize, info.Size())
+	}
+
+	readPrefix := make([]byte, len(prefix))
+	if _, err := file.ReadAt(readPrefix, 0); err != nil {
+		t.Fatalf("ReadAt returned error: %v", err)
+	}
+	if !bytes.Equal(readPrefix, prefix) {
+		t.Fatalf("expected partial bytes preserved, got %q", string(readPrefix))
+	}
+}
+
+func TestEngineDownloadLogsTransportReuseOnRetry(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	body := []byte(strings.Repeat("transport-reuse-", 64))
+	digest := md5.Sum(body)
+	logBuffer := setTestLogger(t, slog.LevelInfo)
+	var attempts atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"transport-reuse"`)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if attempts.Add(1) == 1 {
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		handleRangeResponse(w, r, body, digest)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{URL: server.URL + "/reuse.bin", Filename: "reuse.bin", Segments: 1})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if err := engine.Start(state.ID); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+
+	final := waitForTerminalStateWithin(t, storage, state.ID, 6*time.Second)
+	if final.Status != "finished" {
+		t.Fatalf("expected finished download, got %q (%s)", final.Status, final.Error)
+	}
+
+	logs := logBuffer.String()
+	if !strings.Contains(logs, "event=transport_reused") {
+		t.Fatalf("expected transport_reused log entry, got logs: %s", logs)
+	}
+	if !strings.Contains(logs, "reused=true") {
+		t.Fatalf("expected reused=true in transport log, got logs: %s", logs)
+	}
+}
+
+func TestEngineStealWorkForSplitsLargestRemainingSegment(t *testing.T) {
+	storage := newTestStorage(t)
+	if err := storage.SaveHostSettings(HostSettings{MaxSegmentsPerDownload: 3}); err != nil {
+		t.Fatalf("SaveHostSettings returned error: %v", err)
+	}
+	engine := NewEngine(storage, nil)
+
+	const (
+		victimEnd     = int64(10*1024*1024 - 1)
+		victimCurrent = int64(1 * 1024 * 1024)
+	)
+	state := &DownloadState{
+		ID:        "steal-work-unit",
+		URL:       "https://example.test/file.bin",
+		Status:    "downloading",
+		Type:      "file",
+		CreatedAt: time.Now(),
+		Segments: []Segment{
+			{Index: 0, Start: 0, End: victimEnd, Current: victimCurrent},
+			{Index: 1, Start: victimEnd + 1, End: victimEnd + 1024, Current: 1024, Completed: true},
+		},
+	}
+	if err := storage.SaveDownload(state); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+
+	active := &ActiveDownload{State: state}
+	stolen, ok := engine.stealWorkFor(active, 1)
+	if !ok {
+		t.Fatal("expected stealWorkFor to split remaining work")
+	}
+	if stolen.Index != 2 {
+		t.Fatalf("expected new segment index 2, got %d", stolen.Index)
+	}
+
+	remainingStart := victimCurrent
+	remaining := victimEnd - remainingStart + 1
+	expectedSplitPoint := remainingStart + (remaining / 2) - 1
+	if state.Segments[0].End != expectedSplitPoint {
+		t.Fatalf("expected victim end %d, got %d", expectedSplitPoint, state.Segments[0].End)
+	}
+	if stolen.Start != expectedSplitPoint+1 {
+		t.Fatalf("expected stolen start %d, got %d", expectedSplitPoint+1, stolen.Start)
+	}
+	if stolen.End != victimEnd {
+		t.Fatalf("expected stolen end %d, got %d", victimEnd, stolen.End)
+	}
+	if stolen.Current != 0 {
+		t.Fatalf("expected stolen segment current 0, got %d", stolen.Current)
+	}
+	if len(state.Segments) != 3 {
+		t.Fatalf("expected 3 segments after split, got %d", len(state.Segments))
+	}
+}
+
+func TestEngineStealWorkForRespectsMaxSegmentsCap(t *testing.T) {
+	storage := newTestStorage(t)
+	if err := storage.SaveHostSettings(HostSettings{MaxSegmentsPerDownload: 2}); err != nil {
+		t.Fatalf("SaveHostSettings returned error: %v", err)
+	}
+	engine := NewEngine(storage, nil)
+	state := &DownloadState{
+		ID:        "steal-work-cap",
+		URL:       "https://example.test/file.bin",
+		Status:    "downloading",
+		Type:      "file",
+		CreatedAt: time.Now(),
+		Segments: []Segment{
+			{Index: 0, Start: 0, End: 8*1024*1024 - 1, Current: 0},
+			{Index: 1, Start: 8 * 1024 * 1024, End: 9*1024*1024 - 1, Current: 9*1024*1024 - 8*1024*1024, Completed: true},
+		},
+	}
+
+	active := &ActiveDownload{State: state}
+	if stolen, ok := engine.stealWorkFor(active, 1); ok || stolen != nil {
+		t.Fatal("expected max segment cap to prevent split")
+	}
+	if len(state.Segments) != 2 {
+		t.Fatalf("expected segment count unchanged at 2, got %d", len(state.Segments))
+	}
+}
+
+func TestEngineDownloadStealsWorkFromSlowSegment(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	if err := storage.SaveHostSettings(HostSettings{MaxSegmentsPerDownload: 3}); err != nil {
+		t.Fatalf("SaveHostSettings returned error: %v", err)
+	}
+	engine := NewEngine(storage, nil)
+	body := []byte(strings.Repeat("dynamic-split-", 800000))
+	digest := md5.Sum(body)
+	logBuffer := setTestLogger(t, slog.LevelInfo)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"segment-split"`)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if strings.HasPrefix(r.Header.Get("Range"), "bytes=0-") {
+			handleSlowRangeResponse(w, r, body, digest, 32*1024, 40*time.Millisecond)
+			return
+		}
+		handleRangeResponse(w, r, body, digest)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{URL: server.URL + "/split.bin", Filename: "split.bin", Segments: 2})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if err := engine.Start(state.ID); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+
+	final := waitForTerminalStateWithin(t, storage, state.ID, 12*time.Second)
+	if final.Status != "finished" {
+		t.Fatalf("expected finished download, got %q (%s)", final.Status, final.Error)
+	}
+	if len(final.Segments) < 3 {
+		t.Fatalf("expected dynamic split to add a segment, got %d segments", len(final.Segments))
+	}
+	if !strings.Contains(logBuffer.String(), "event=segment_split") {
+		t.Fatalf("expected segment_split log entry, got logs: %s", logBuffer.String())
+	}
+
+	downloaded, err := os.ReadFile(final.OutputPath)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if !bytes.Equal(downloaded, body) {
+		t.Fatal("expected dynamically split download to match source body")
 	}
 }
 
@@ -1691,4 +1961,56 @@ func handleRangeResponse(w http.ResponseWriter, r *http.Request, body []byte, di
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+}
+
+func handleSlowRangeResponse(w http.ResponseWriter, r *http.Request, body []byte, digest [16]byte, chunkSize int, chunkDelay time.Duration) {
+	w.Header().Set("Content-MD5", base64.StdEncoding.EncodeToString(digest[:]))
+	w.Header().Set("Accept-Ranges", "bytes")
+
+	start := 0
+	end := len(body) - 1
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+		if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err != nil {
+			if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-", &start); err != nil {
+				http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			end = len(body) - 1
+		}
+
+		if start < 0 || start >= len(body) || end < start {
+			http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if end >= len(body) {
+			end = len(body) - 1
+		}
+
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(body)))
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", end-start+1))
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		w.WriteHeader(http.StatusOK)
+	}
+
+	for offset := start; offset <= end; offset += chunkSize {
+		select {
+		case <-r.Context().Done():
+			return
+		default:
+		}
+
+		chunkEnd := offset + chunkSize
+		if chunkEnd > end+1 {
+			chunkEnd = end + 1
+		}
+		_, _ = w.Write(body[offset:chunkEnd])
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		if chunkEnd <= end {
+			time.Sleep(chunkDelay)
+		}
+	}
 }

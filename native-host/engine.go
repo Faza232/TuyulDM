@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"path"
@@ -28,9 +29,10 @@ import (
 )
 
 const (
-	defaultSegments   = 8
-	maxRedirects      = 10
-	maxSegmentRetries = 5
+	defaultSegments            = 8
+	maxRedirects               = 10
+	maxSegmentRetries          = 5
+	segmentSplitThresholdBytes = 4 * 1024 * 1024
 )
 
 var forwardedHeaderAllowlist = map[string]struct{}{
@@ -405,6 +407,8 @@ type ActiveDownload struct {
 	Cancel             context.CancelFunc
 	Done               chan struct{}
 	File               *os.File
+	HTTPClient         *http.Client
+	IdleConnections    atomic.Int64
 	PerDownloadLimiter atomic.Pointer[rate.Limiter]
 	mu                 sync.Mutex
 }
@@ -499,7 +503,7 @@ func (e *Engine) Add(ctx context.Context, req DownloadRequest) (*DownloadState, 
 		LastModified:   metadata.LastModified,
 		TotalSizeAtAdd: metadata.TotalSize,
 		ProbedAt:       probedAt,
-		Segments:       buildSegments(metadata.TotalSize, req.Segments, metadata.AcceptRanges),
+		Segments:       buildSegments(metadata.TotalSize, clampRequestedSegments(req.Segments, e.hostSettingsSnapshot().MaxSegmentsPerDownload), metadata.AcceptRanges),
 		Schedule:       cloneDownloadSchedule(req.Schedule),
 	}
 
@@ -603,6 +607,7 @@ func (e *Engine) Start(id string) error {
 func (e *Engine) runDownload(a *ActiveDownload) {
 	restartAfterRemoteChange := false
 	defer func() {
+		closeActiveDownloadHTTPClient(a)
 		if a.File != nil {
 			_ = a.File.Close()
 			a.File = nil
@@ -626,19 +631,12 @@ func (e *Engine) runDownload(a *ActiveDownload) {
 		}
 	}()
 
-	file, err := os.OpenFile(downloadPath(a.State), os.O_CREATE|os.O_WRONLY, 0o644)
+	file, err := openDownloadOutputFile(a.State)
 	if err != nil {
 		e.failDownload(a, err)
 		return
 	}
 	a.File = file
-
-	if a.State.TotalSize > 0 {
-		if err := file.Truncate(a.State.TotalSize); err != nil {
-			e.failDownload(a, err)
-			return
-		}
-	}
 
 	var wg sync.WaitGroup
 	var lastError error
@@ -795,38 +793,50 @@ func formatSpeed(bytesPerSec int64) string {
 }
 
 func (e *Engine) downloadSegment(a *ActiveDownload, idx int) error {
-	for attempt := 0; attempt < maxSegmentRetries; attempt++ {
-		err := e.downloadSegmentAttempt(a, idx, attempt)
-		if err == nil {
+	for {
+		completed := false
+		for attempt := 0; attempt < maxSegmentRetries; attempt++ {
+			err := e.downloadSegmentAttempt(a, idx, attempt)
+			if err == nil {
+				completed = true
+				break
+			}
+
+			var resetErr *rangeResumeResetError
+			if errors.As(err, &resetErr) {
+				continue
+			}
+
+			if delay, ok := retryDelayForSegmentError(err, attempt); ok {
+				a.mu.Lock()
+				downloadID := a.State.ID
+				requestURL := a.State.URL
+				a.mu.Unlock()
+				e.recordSegmentRetryAttempt(a, idx, requestURL, attempt+1, err, delay)
+				if attempt == maxSegmentRetries-1 {
+					finalErr := withErrorCode(downloadErrorCode(err), fmt.Errorf("segment %d exhausted retries: %w", idx, err))
+					slog.Error("segment exhausted retries", segmentRetryLogAttrs(DownloadState{ID: downloadID}, idx, requestURL, attempt+1, err, delay)...)
+					return finalErr
+				}
+				if waitErr := waitForRetry(a.Ctx, delay); waitErr != nil {
+					return waitErr
+				}
+				continue
+			}
+
+			return err
+		}
+
+		if !completed {
+			return withErrorCode("download_failed", fmt.Errorf("segment %d exhausted retries", idx))
+		}
+
+		stolen, ok := e.stealWorkFor(a, idx)
+		if !ok {
 			return nil
 		}
-
-		var resetErr *rangeResumeResetError
-		if errors.As(err, &resetErr) {
-			continue
-		}
-
-		if delay, ok := retryDelayForSegmentError(err, attempt); ok {
-			a.mu.Lock()
-			downloadID := a.State.ID
-			requestURL := a.State.URL
-			a.mu.Unlock()
-			e.recordSegmentRetryAttempt(a, idx, requestURL, attempt+1, err, delay)
-			if attempt == maxSegmentRetries-1 {
-				finalErr := withErrorCode(downloadErrorCode(err), fmt.Errorf("segment %d exhausted retries: %w", idx, err))
-				slog.Error("segment exhausted retries", segmentRetryLogAttrs(DownloadState{ID: downloadID}, idx, requestURL, attempt+1, err, delay)...)
-				return finalErr
-			}
-			if waitErr := waitForRetry(a.Ctx, delay); waitErr != nil {
-				return waitErr
-			}
-			continue
-		}
-
-		return err
+		idx = stolen.Index
 	}
-
-	return withErrorCode("download_failed", fmt.Errorf("segment %d exhausted retries", idx))
 }
 
 func logForwardedCookieContext(requestURL string, headers map[string]string, cookies []RequestCookie) {
@@ -849,7 +859,6 @@ func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int, attempt int)
 	filename := a.State.Filename
 	totalSize := a.State.TotalSize
 	headers := cloneStringMap(a.State.Headers)
-	cookies := append([]RequestCookie(nil), a.State.Cookies...)
 	segmentCount := len(a.State.Segments)
 	ifRangeValue := preferredResumeValidator(a.State)
 	a.mu.Unlock()
@@ -859,19 +868,22 @@ func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int, attempt int)
 		return e.completeSegment(a, idx)
 	}
 
-	client, err := newHTTPClient(stateURL, cookies, true)
-	if err != nil {
-		return err
+	a.mu.Lock()
+	client := a.HTTPClient
+	a.mu.Unlock()
+	if client == nil {
+		return fmt.Errorf("download client unavailable")
 	}
 
 	reqCtx, cancel := context.WithCancelCause(a.Ctx)
 	defer cancel(nil)
+	reqCtx, transportState := instrumentTransportAcquisition(reqCtx, a)
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, stateURL, nil)
 	if err != nil {
 		return err
 	}
-	applyRequestHeaders(req, headers, cookies)
+	applyClientManagedRequestHeaders(req, headers)
 
 	rangeRequested := false
 	ifRangeRequested := false
@@ -893,6 +905,7 @@ func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int, attempt int)
 		return resolveRequestContextError(reqCtx, err)
 	}
 	defer resp.Body.Close()
+	logTransportReuse(downloadID, stateURL, idx, attempt, transportState)
 	stallReader := newStallWatchReader(reqCtx, resp.Body, cancel, stallTimeout)
 	defer stallReader.Stop()
 	reader := newThrottledReader(reqCtx, stallReader, &a.PerDownloadLimiter, e.globalLimiterSnapshot())
@@ -1009,23 +1022,57 @@ func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int, attempt int)
 		)
 	}
 
-	writeOffset := startOffset
 	buf := make([]byte, 32*1024)
 	for {
 		n, readErr := reader.Read(buf)
 		if n > 0 {
-			written, writeErr := a.File.WriteAt(buf[:n], writeOffset)
-			if writeErr != nil {
-				return writeErr
+			writeLen := n
+			reachedSegmentEnd := false
+			reservedOffset := int64(0)
+
+			a.mu.Lock()
+			segment := &a.State.Segments[idx]
+			reservedOffset = segment.Start + segment.Current
+			if totalLength := segmentTotalLength(*segment); totalLength > 0 {
+				remaining := totalLength - segment.Current
+				switch {
+				case remaining <= 0:
+					writeLen = 0
+					reachedSegmentEnd = true
+				case int64(writeLen) > remaining:
+					writeLen = int(remaining)
+					reachedSegmentEnd = true
+				}
 			}
-			if written != n {
+			if writeLen > 0 {
+				segment.Current += int64(writeLen)
+				if totalLength := segmentTotalLength(*segment); totalLength > 0 && segment.Current >= totalLength {
+					reachedSegmentEnd = true
+				}
+			}
+			a.mu.Unlock()
+
+			if writeLen == 0 {
+				return e.completeSegment(a, idx)
+			}
+
+			written, writeErr := a.File.WriteAt(buf[:writeLen], reservedOffset)
+			if writeErr != nil {
+				a.mu.Lock()
+				a.State.Segments[idx].Current -= int64(writeLen)
+				a.mu.Unlock()
+				return classifyDownloadIOError(writeErr)
+			}
+			if written != writeLen {
+				a.mu.Lock()
+				a.State.Segments[idx].Current -= int64(writeLen)
+				a.mu.Unlock()
 				return io.ErrShortWrite
 			}
 
-			writeOffset += int64(n)
-			a.mu.Lock()
-			a.State.Segments[idx].Current += int64(n)
-			a.mu.Unlock()
+			if reachedSegmentEnd {
+				return e.completeSegment(a, idx)
+			}
 		}
 
 		if readErr != nil {
@@ -1092,9 +1139,7 @@ func (e *Engine) invalidateAllProgressOnRemoteChange(a *ActiveDownload) error {
 	if meta.TotalSize > 0 {
 		recoveredSize = meta.TotalSize
 	}
-	if requestedSegments < 1 {
-		requestedSegments = 1
-	}
+	requestedSegments = clampRequestedSegments(requestedSegments, e.hostSettingsSnapshot().MaxSegmentsPerDownload)
 
 	a.mu.Lock()
 	a.State.URL = meta.FinalURL
@@ -1297,7 +1342,7 @@ func (e *Engine) RefreshURL(id string, newURL string, force bool, restartFromScr
 		state.Progress = 0
 		state.TotalSize = meta.TotalSize
 		state.TotalSizeAtAdd = meta.TotalSize
-		state.Segments = buildSegments(meta.TotalSize, requestedSegmentsForState(state), meta.AcceptRanges)
+		state.Segments = buildSegments(meta.TotalSize, clampRequestedSegments(requestedSegmentsForState(state), e.hostSettingsSnapshot().MaxSegmentsPerDownload), meta.AcceptRanges)
 	}
 
 	if !restartFromScratch {
@@ -1553,22 +1598,84 @@ func doRequestWithRedirects(ctx context.Context, method string, startURL string,
 	return nil, currentURL, fmt.Errorf("too many redirects")
 }
 
+func downloadRequestURLs(state *DownloadState) []string {
+	if state == nil {
+		return nil
+	}
+
+	seen := make(map[string]struct{})
+	urls := make([]string, 0, len(state.Segments)+1)
+	appendURL := func(raw string) {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			return
+		}
+		if _, ok := seen[trimmed]; ok {
+			return
+		}
+		seen[trimmed] = struct{}{}
+		urls = append(urls, trimmed)
+	}
+
+	appendURL(state.URL)
+	for _, segment := range state.Segments {
+		appendURL(segment.URL)
+	}
+	return urls
+}
+
+func seedCookieJar(jar http.CookieJar, rawURLs []string, cookies []RequestCookie) {
+	if jar == nil || len(cookies) == 0 {
+		return
+	}
+
+	jarCookies := make([]*http.Cookie, 0, len(cookies))
+	for _, cookie := range cookies {
+		jarCookies = append(jarCookies, cookie.toHTTPCookie())
+	}
+
+	for _, rawURL := range rawURLs {
+		parsedURL, err := url.Parse(rawURL)
+		if err != nil {
+			continue
+		}
+		jar.SetCookies(parsedURL, jarCookies)
+	}
+}
+
+func newActiveDownloadHTTPClient(state *DownloadState) (*http.Client, error) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, err
+	}
+	seedCookieJar(jar, downloadRequestURLs(state), state.Cookies)
+
+	baseTransport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, fmt.Errorf("default transport unavailable")
+	}
+	transport := baseTransport.Clone()
+	transport.Proxy = http.ProxyFromEnvironment
+	transport.MaxIdleConns = 64
+	transport.MaxIdleConnsPerHost = 32
+	transport.MaxConnsPerHost = 32
+	transport.IdleConnTimeout = 90 * time.Second
+	transport.ForceAttemptHTTP2 = true
+	transport.DisableCompression = true
+
+	return &http.Client{
+		Jar:       jar,
+		Transport: transport,
+	}, nil
+}
+
 func newHTTPClient(rawURL string, cookies []RequestCookie, followRedirects bool) (*http.Client, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(cookies) > 0 {
-		parsedURL, err := url.Parse(rawURL)
-		if err == nil {
-			jarCookies := make([]*http.Cookie, 0, len(cookies))
-			for _, cookie := range cookies {
-				jarCookies = append(jarCookies, cookie.toHTTPCookie())
-			}
-			jar.SetCookies(parsedURL, jarCookies)
-		}
-	}
+	seedCookieJar(jar, []string{rawURL}, cookies)
 
 	client := &http.Client{Jar: jar}
 	if !followRedirects {
@@ -1595,6 +1702,11 @@ func applyRequestHeaders(req *http.Request, headers map[string]string, cookies [
 	for _, cookie := range cookies {
 		req.AddCookie(cookie.toHTTPCookie())
 	}
+}
+
+func applyClientManagedRequestHeaders(req *http.Request, headers map[string]string) {
+	applyRequestHeaders(req, headers, nil)
+	req.Header.Del("Cookie")
 }
 
 func metadataFromResponse(finalURL string, resp *http.Response) downloadMetadata {
@@ -1669,6 +1781,115 @@ func waitForRetry(ctx context.Context, duration time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func clampRequestedSegments(requestedSegments int, maxSegments int) int {
+	resolved := requestedSegments
+	if resolved <= 0 {
+		resolved = defaultSegments
+	}
+	if maxSegments > 0 && resolved > maxSegments {
+		resolved = maxSegments
+	}
+	return resolved
+}
+
+func segmentTotalLength(seg Segment) int64 {
+	if seg.End < seg.Start || seg.End < 0 {
+		return 0
+	}
+	return seg.End - seg.Start + 1
+}
+
+func segmentRemainingBytes(seg Segment) int64 {
+	if seg.Completed {
+		return 0
+	}
+	totalLength := segmentTotalLength(seg)
+	if totalLength <= 0 {
+		return 0
+	}
+	remaining := totalLength - seg.Current
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func (e *Engine) stealWorkFor(a *ActiveDownload, idleIdx int) (*Segment, bool) {
+	maxSegments := e.hostSettingsSnapshot().MaxSegmentsPerDownload
+
+	a.mu.Lock()
+	if maxSegments > 0 && len(a.State.Segments) >= maxSegments {
+		a.mu.Unlock()
+		return nil, false
+	}
+
+	victimIdx := -1
+	victimRemaining := int64(0)
+	for idx, seg := range a.State.Segments {
+		if idx == idleIdx || seg.Completed {
+			continue
+		}
+		remaining := segmentRemainingBytes(seg)
+		if remaining > victimRemaining {
+			victimIdx = idx
+			victimRemaining = remaining
+		}
+	}
+	if victimIdx < 0 || victimRemaining < segmentSplitThresholdBytes {
+		a.mu.Unlock()
+		return nil, false
+	}
+
+	victim := &a.State.Segments[victimIdx]
+	remainingStart := victim.Start + victim.Current
+	if remainingStart > victim.End {
+		a.mu.Unlock()
+		return nil, false
+	}
+	remaining := victim.End - remainingStart + 1
+	if remaining < segmentSplitThresholdBytes {
+		a.mu.Unlock()
+		return nil, false
+	}
+
+	splitSize := remaining / 2
+	if splitSize < 1 {
+		a.mu.Unlock()
+		return nil, false
+	}
+	splitPoint := remainingStart + splitSize - 1
+	oldEnd := victim.End
+	victim.End = splitPoint
+
+	newSegment := Segment{
+		Index:    len(a.State.Segments),
+		Start:    splitPoint + 1,
+		End:      oldEnd,
+		Current:  0,
+		URL:      victim.URL,
+		Track:    victim.Track,
+		Duration: victim.Duration,
+	}
+	a.State.Segments = append(a.State.Segments, newSegment)
+	snapshot := cloneDownloadState(a.State)
+	a.mu.Unlock()
+
+	newSize := segmentTotalLength(newSegment)
+	slog.Info("segment split created",
+		"download_id", snapshot.ID,
+		"idle_index", idleIdx,
+		"from_index", victimIdx,
+		"from_remaining", victimRemaining,
+		"new_index", newSegment.Index,
+		"new_size", newSize,
+		"event", "segment_split",
+	)
+	e.persistSnapshot(snapshot)
+
+	stolen := newSegment
+	return &stolen, true
 }
 
 func buildSegments(totalSize int64, requestedSegments int, canSegment bool) []Segment {
@@ -1961,6 +2182,7 @@ func (e *Engine) persistActiveState(a *ActiveDownload) {
 }
 
 func (e *Engine) failDownload(a *ActiveDownload, err error) {
+	err = classifyDownloadIOError(err)
 	e.releaseActiveSlot(a.State.ID)
 
 	a.mu.Lock()
@@ -1985,6 +2207,100 @@ func cloneDownloadState(state *DownloadState) DownloadState {
 	clone.Segments = append([]Segment(nil), state.Segments...)
 	clone.Schedule = cloneDownloadSchedule(state.Schedule)
 	return clone
+}
+
+type transportAcquireState struct {
+	reused    bool
+	wasIdle   bool
+	idleConns int64
+}
+
+func instrumentTransportAcquisition(ctx context.Context, a *ActiveDownload) (context.Context, *transportAcquireState) {
+	state := &transportAcquireState{idleConns: a.IdleConnections.Load()}
+	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			state.reused = info.Reused
+			state.wasIdle = info.WasIdle
+			if info.WasIdle {
+				current := a.IdleConnections.Add(-1)
+				if current < 0 {
+					a.IdleConnections.Store(0)
+					current = 0
+				}
+				state.idleConns = current
+				return
+			}
+			state.idleConns = a.IdleConnections.Load()
+		},
+		PutIdleConn: func(err error) {
+			if err == nil {
+				a.IdleConnections.Add(1)
+			}
+		},
+	}
+	return httptrace.WithClientTrace(ctx, trace), state
+}
+
+func logTransportReuse(downloadID string, requestURL string, segmentIndex int, attempt int, state *transportAcquireState) {
+	if state == nil {
+		return
+	}
+	slog.Info("segment transport acquired",
+		"download_id", downloadID,
+		"url", requestURL,
+		"segment_index", segmentIndex,
+		"attempt", attempt+1,
+		"event", "transport_reused",
+		"reused", state.reused,
+		"was_idle", state.wasIdle,
+		"idle_conns", state.idleConns,
+	)
+}
+
+func closeActiveDownloadHTTPClient(a *ActiveDownload) {
+	if a == nil || a.HTTPClient == nil {
+		return
+	}
+	a.HTTPClient.CloseIdleConnections()
+}
+
+func openDownloadOutputFile(state *DownloadState) (*os.File, error) {
+	outputPath := downloadPath(state)
+	if strings.TrimSpace(outputPath) == "" {
+		return nil, fmt.Errorf("output path is required")
+	}
+
+	_, statErr := os.Stat(outputPath)
+	hadExistingFile := statErr == nil
+	file, err := os.OpenFile(outputPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, classifyDownloadIOError(err)
+	}
+
+	if state.TotalSize <= 0 {
+		return file, nil
+	}
+
+	if err := preallocateFileSpace(file, state.TotalSize); err != nil {
+		_ = file.Close()
+		if !hadExistingFile {
+			_ = os.Remove(outputPath)
+		}
+		return nil, classifyDownloadIOError(err)
+	}
+
+	return file, nil
+}
+
+func classifyDownloadIOError(err error) error {
+	if err == nil {
+		return nil
+	}
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "no space left on device") || strings.Contains(lower, "disk full") || strings.Contains(lower, "not enough space on the disk") {
+		return withErrorCode("disk_full", err)
+	}
+	return err
 }
 
 func cloneStringMap(values map[string]string) map[string]string {
@@ -2044,14 +2360,19 @@ func (e *Engine) startQueuedDownload(id string) error {
 	if err != nil {
 		return err
 	}
+	client, err := newActiveDownloadHTTPClient(state)
+	if err != nil {
+		return err
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	settings := e.hostSettingsSnapshot()
 	active := &ActiveDownload{
-		State:  state,
-		Ctx:    ctx,
-		Cancel: cancel,
-		Done:   make(chan struct{}),
+		State:      state,
+		Ctx:        ctx,
+		Cancel:     cancel,
+		Done:       make(chan struct{}),
+		HTTPClient: client,
 	}
 	active.PerDownloadLimiter.Store(newRateLimiter(settings.PerDownloadThrottleBytesPerSecond))
 
@@ -2076,6 +2397,7 @@ func (e *Engine) startQueuedDownload(id string) error {
 		e.mu.Lock()
 		delete(e.active, id)
 		e.mu.Unlock()
+		closeActiveDownloadHTTPClient(active)
 		cancel()
 		return err
 	}

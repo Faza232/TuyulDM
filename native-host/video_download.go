@@ -121,6 +121,7 @@ func totalKnownSegmentBytes(segments []Segment) (int64, bool) {
 }
 
 func (e *Engine) runVideoDownload(a *ActiveDownload) {
+	defer closeActiveDownloadHTTPClient(a)
 	defer close(a.Done)
 	defer e.persistActiveState(a)
 
@@ -278,7 +279,7 @@ func minInt(a int, b int) int {
 
 func (e *Engine) downloadVideoSegment(a *ActiveDownload, idx int, segmentDir string) error {
 	for attempt := 0; attempt < maxSegmentRetries; attempt++ {
-		err := e.downloadVideoSegmentAttempt(a, idx, segmentDir)
+		err := e.downloadVideoSegmentAttempt(a, idx, segmentDir, attempt)
 		if err == nil {
 			return nil
 		}
@@ -314,12 +315,12 @@ func (e *Engine) downloadVideoSegment(a *ActiveDownload, idx int, segmentDir str
 	return withErrorCode("download_failed", fmt.Errorf("video segment %d exhausted retries", idx))
 }
 
-func (e *Engine) downloadVideoSegmentAttempt(a *ActiveDownload, idx int, segmentDir string) error {
+func (e *Engine) downloadVideoSegmentAttempt(a *ActiveDownload, idx int, segmentDir string, attempt int) error {
 	a.mu.Lock()
 	segment := a.State.Segments[idx]
 	downloadID := a.State.ID
 	headers := cloneStringMap(a.State.Headers)
-	cookies := append([]RequestCookie(nil), a.State.Cookies...)
+	client := a.HTTPClient
 	a.mu.Unlock()
 
 	if segment.Completed {
@@ -340,16 +341,16 @@ func (e *Engine) downloadVideoSegmentAttempt(a *ActiveDownload, idx int, segment
 		}
 	}
 
-	client, err := newHTTPClient(segment.URL, cookies, true)
-	if err != nil {
-		return err
+	if client == nil {
+		return fmt.Errorf("download client unavailable")
 	}
 
-	req, err := http.NewRequestWithContext(a.Ctx, http.MethodGet, segment.URL, nil)
+	reqCtx, transportState := instrumentTransportAcquisition(a.Ctx, a)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, segment.URL, nil)
 	if err != nil {
 		return err
 	}
-	applyRequestHeaders(req, headers, cookies)
+	applyClientManagedRequestHeaders(req, headers)
 
 	rangeRequested := false
 	writeOffset := resumeOffset
@@ -371,6 +372,7 @@ func (e *Engine) downloadVideoSegmentAttempt(a *ActiveDownload, idx int, segment
 		return err
 	}
 	defer resp.Body.Close()
+	logTransportReuse(downloadID, segment.URL, idx, attempt, transportState)
 	reader := newThrottledReader(a.Ctx, resp.Body, &a.PerDownloadLimiter, e.globalLimiterSnapshot())
 
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
@@ -421,7 +423,7 @@ func (e *Engine) downloadVideoSegmentAttempt(a *ActiveDownload, idx int, segment
 		if n > 0 {
 			written, writeErr := file.WriteAt(buf[:n], writeOffset)
 			if writeErr != nil {
-				return writeErr
+				return classifyDownloadIOError(writeErr)
 			}
 			if written != n {
 				return io.ErrShortWrite

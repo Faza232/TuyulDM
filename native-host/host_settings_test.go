@@ -49,3 +49,22 @@ func TestNormalizeHostSettingsClampsSegmentStallTimeout(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeHostSettingsClampsMaxSegmentsPerDownload(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    int
+		expected int
+	}{
+		{name: "default", input: 0, expected: defaultMaxSegmentsPerDownload},
+		{name: "minimum", input: 1, expected: 1},
+		{name: "maximum", input: 999, expected: maxSegmentsPerDownloadLimit},
+	}
+
+	for _, tc := range testCases {
+		settings := normalizeHostSettings(HostSettings{MaxSegmentsPerDownload: tc.input})
+		if settings.MaxSegmentsPerDownload != tc.expected {
+			t.Fatalf("%s: expected max segments %d, got %d", tc.name, tc.expected, settings.MaxSegmentsPerDownload)
+		}
+	}
+}

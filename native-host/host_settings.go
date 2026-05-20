@@ -5,6 +5,8 @@ import "strings"
 const (
 	defaultMaxConcurrentDownloads = 3
 	maxConcurrentDownloadsLimit   = 32
+	defaultMaxSegmentsPerDownload = 32
+	maxSegmentsPerDownloadLimit   = 32
 	defaultSegmentStallTimeoutSec = 30
 	minSegmentStallTimeoutSec     = 5
 	maxSegmentStallTimeoutSec     = 600
@@ -12,6 +14,7 @@ const (
 
 type HostSettings struct {
 	MaxConcurrentDownloads            int    `json:"maxConcurrentDownloads"`
+	MaxSegmentsPerDownload            int    `json:"maxSegmentsPerDownload"`
 	GlobalThrottleBytesPerSecond      int64  `json:"globalThrottleBytesPerSecond"`
 	PerDownloadThrottleBytesPerSecond int64  `json:"perDownloadThrottleBytesPerSecond"`
 	SegmentStallTimeoutSec            int    `json:"segmentStallTimeoutSec"`
@@ -21,6 +24,7 @@ type HostSettings struct {
 
 type HostSettingsUpdate struct {
 	MaxConcurrentDownloads            *int    `json:"maxConcurrentDownloads,omitempty"`
+	MaxSegmentsPerDownload            *int    `json:"maxSegmentsPerDownload,omitempty"`
 	GlobalThrottleBytesPerSecond      *int64  `json:"globalThrottleBytesPerSecond,omitempty"`
 	PerDownloadThrottleBytesPerSecond *int64  `json:"perDownloadThrottleBytesPerSecond,omitempty"`
 	SegmentStallTimeoutSec            *int    `json:"segmentStallTimeoutSec,omitempty"`
@@ -31,6 +35,7 @@ type HostSettingsUpdate struct {
 func defaultHostSettings() HostSettings {
 	return HostSettings{
 		MaxConcurrentDownloads: defaultMaxConcurrentDownloads,
+		MaxSegmentsPerDownload: defaultMaxSegmentsPerDownload,
 		SegmentStallTimeoutSec: defaultSegmentStallTimeoutSec,
 		LogLevel:               defaultHostLogLevel,
 	}
@@ -42,6 +47,12 @@ func normalizeHostSettings(settings HostSettings) HostSettings {
 	}
 	if settings.MaxConcurrentDownloads > maxConcurrentDownloadsLimit {
 		settings.MaxConcurrentDownloads = maxConcurrentDownloadsLimit
+	}
+	if settings.MaxSegmentsPerDownload <= 0 {
+		settings.MaxSegmentsPerDownload = defaultMaxSegmentsPerDownload
+	}
+	if settings.MaxSegmentsPerDownload > maxSegmentsPerDownloadLimit {
+		settings.MaxSegmentsPerDownload = maxSegmentsPerDownloadLimit
 	}
 	if settings.GlobalThrottleBytesPerSecond < 0 {
 		settings.GlobalThrottleBytesPerSecond = 0
@@ -66,6 +77,9 @@ func normalizeHostSettings(settings HostSettings) HostSettings {
 func applyHostSettingsUpdate(current HostSettings, update HostSettingsUpdate) HostSettings {
 	if update.MaxConcurrentDownloads != nil {
 		current.MaxConcurrentDownloads = *update.MaxConcurrentDownloads
+	}
+	if update.MaxSegmentsPerDownload != nil {
+		current.MaxSegmentsPerDownload = *update.MaxSegmentsPerDownload
 	}
 	if update.GlobalThrottleBytesPerSecond != nil {
 		current.GlobalThrottleBytesPerSecond = *update.GlobalThrottleBytesPerSecond
