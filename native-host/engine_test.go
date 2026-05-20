@@ -228,6 +228,48 @@ func TestEngineAddWarnsWhenValidatorsAreUnavailable(t *testing.T) {
 	}
 }
 
+func TestEngineAddPrefersProbedContentDispositionFilenameOverGenericRequestedName(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	settings := defaultHostSettings()
+	settings.DownloadDir = t.TempDir()
+	if err := storage.SaveHostSettings(settings); err != nil {
+		t.Fatalf("SaveHostSettings returned error: %v", err)
+	}
+	engine := NewEngine(storage, nil)
+	body := []byte("content disposition filename")
+	digest := md5.Sum(body)
+	const expectedName = "Quarterly Report.zip"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"content-disposition"`)
+		w.Header().Set("Content-Disposition", `attachment; filename="Quarterly Report.zip"`)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		handleRangeResponse(w, r, body, digest)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{
+		URL:      server.URL + "/download",
+		Filename: "download",
+		Segments: 4,
+	})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if state.Filename != expectedName {
+		t.Fatalf("expected filename %q, got %q", expectedName, state.Filename)
+	}
+	if filepath.Base(state.OutputPath) != expectedName {
+		t.Fatalf("expected output path basename %q, got %q", expectedName, filepath.Base(state.OutputPath))
+	}
+}
+
 func TestEngineDownloadUsesForwardedHeadersAndCookies(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", t.TempDir())
 	storage := newTestStorage(t)
@@ -1501,6 +1543,11 @@ func TestEngineResumeRemoteChangeSizeMismatchFails(t *testing.T) {
 
 func TestEngineDownloadMarksAwaitingURLRefreshOnExpiredLink(t *testing.T) {
 	storage := newTestStorage(t)
+	settings := defaultHostSettings()
+	settings.DownloadDir = t.TempDir()
+	if err := storage.SaveHostSettings(settings); err != nil {
+		t.Fatalf("SaveHostSettings returned error: %v", err)
+	}
 	engine := NewEngine(storage, nil)
 	var attempts atomic.Int32
 	logBuffer := setTestLogger(t, slog.LevelWarn)
@@ -1538,6 +1585,9 @@ func TestEngineDownloadMarksAwaitingURLRefreshOnExpiredLink(t *testing.T) {
 	}
 	if !strings.Contains(logBuffer.String(), "event=url_expired") {
 		t.Fatalf("expected url_expired log entry, got logs: %s", logBuffer.String())
+	}
+	if _, err := os.Stat(state.OutputPath); !os.IsNotExist(err) {
+		t.Fatalf("expected expired placeholder output to be removed, stat err=%v", err)
 	}
 }
 

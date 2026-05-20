@@ -75,6 +75,8 @@ const FORWARDED_HEADERS = new Map([
   ['user-agent', 'User-Agent'],
 ]);
 const DETECTED_MEDIA_TTL_MS = 5 * 60_000;
+const DOWNLOAD_EVENT_FRESHNESS_WINDOW_MS = 30_000;
+const BACKGROUND_STARTED_AT_MS = Date.now();
 
 type OverlayDownloadSchedule = {
   start_hour: number;
@@ -171,6 +173,28 @@ function isRequestableOriginUrl(rawUrl: string) {
   } catch {
     return false;
   }
+}
+
+function getRelatedOriginPatternsForUrl(rawUrl: string) {
+  try {
+    const hostname = new URL(rawUrl).hostname.toLowerCase();
+    if (hostname === 'drive.google.com' || hostname === 'docs.google.com') {
+      return ['*://drive.usercontent.google.com/*'];
+    }
+  } catch {
+    // Ignore malformed URLs.
+  }
+
+  return [] as string[];
+}
+
+function getPermissionRequestOriginsForUrl(rawUrl: string) {
+  const originPattern = getOriginPattern(rawUrl);
+  if (!originPattern || !isRequestableOriginUrl(rawUrl)) {
+    return [] as string[];
+  }
+
+  return normalizeGrantedOrigins([originPattern, ...getRelatedOriginPatternsForUrl(rawUrl)]);
 }
 
 async function getPermissionStatus(): Promise<PermissionStatusPayload> {
@@ -774,6 +798,7 @@ function extensionFromMime(mime: unknown) {
 function resolveDownloadExtension(item: any) {
   return (
     extensionFromFilename(item?.filename)
+    || extensionFromFilename(item?.suggestedFilename)
     || getFileExtension(item?.finalUrl || '')
     || getFileExtension(item?.url || '')
     || extensionFromMime(item?.mime)
@@ -791,6 +816,32 @@ function getOriginPattern(url: string) {
   } catch {
     return null;
   }
+}
+
+function parseDownloadTimestamp(value: unknown) {
+  if (typeof value !== 'string' || !value) {
+    return 0;
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function isHistoricalDownloadReplay(item: any) {
+  if (item?.state === 'complete') {
+    return true;
+  }
+
+  if (typeof item?.endTime === 'string' && item.endTime) {
+    return true;
+  }
+
+  const startedAt = parseDownloadTimestamp(item?.startTime);
+  if (startedAt > 0 && startedAt + DOWNLOAD_EVENT_FRESHNESS_WINDOW_MS < BACKGROUND_STARTED_AT_MS) {
+    return true;
+  }
+
+  return false;
 }
 
 async function hasOriginPermission(url: string) {
@@ -867,6 +918,11 @@ function getDownloadFilename(item: any) {
     return existingName;
   }
 
+  const suggestedName = item.suggestedFilename?.split(/[\\/]/).pop();
+  if (suggestedName) {
+    return suggestedName;
+  }
+
   const sourceUrl = resolveDownloadUrl(item);
   try {
     const lastSegment = new URL(sourceUrl).pathname.split('/').pop();
@@ -935,6 +991,10 @@ function getCapturedRequestHeaders(url: string) {
 }
 
 async function getCookiesForUrl(url: string) {
+  if (!await hasOriginPermission(url)) {
+    return [];
+  }
+
   try {
     const cookies = await browserApi.cookies.getAll({ url });
     return cookies.map(({ name, value, domain, path }: any) => ({
@@ -1107,6 +1167,17 @@ async function interceptDownload(item: any) {
     return;
   }
 
+  if (isHistoricalDownloadReplay(item)) {
+    console.log('[TuyulDM] Skip intercept: historical or completed browser download replay', {
+      id: item?.id,
+      url: item?.url,
+      state: item?.state,
+      startTime: item?.startTime,
+      endTime: item?.endTime,
+    });
+    return;
+  }
+
   const downloadUrl = resolveDownloadUrl(item);
   const settings = await getInterceptionSettings();
   if (!shouldInterceptDownload(item, settings)) {
@@ -1115,8 +1186,7 @@ async function interceptDownload(item: any) {
 
   const permissionGranted = await hasOriginPermission(downloadUrl);
   if (!permissionGranted) {
-    console.warn('[TuyulDM] Skip intercept: origin permission not granted. Open the TuyulDM popup or options page and grant access for this site to enable interception.', downloadUrl);
-    return;
+    console.warn('[TuyulDM] Origin permission not granted for auto-intercept. Proceeding best-effort without site access; grant access from the popup or options page if this download needs authentication.', downloadUrl);
   }
 
   console.log('[TuyulDM] Intercepting download', { url: downloadUrl, filename: item?.filename, mime: item?.mime });
@@ -1314,12 +1384,14 @@ browserApi.runtime.onMessage.addListener(((message: any, sender: any, sendRespon
   }
 
   if (message.type === 'REQUEST_CURRENT_TAB_PERMISSION') {
-    getPermissionStatus()
-      .then(async (status) => {
-        if (!status.currentOriginPattern || !status.canRequestCurrentOrigin) {
+    Promise.all([getPermissionStatus(), getActiveTab()])
+      .then(async ([status, tab]) => {
+        const currentUrl = typeof tab?.url === 'string' ? tab.url : '';
+        const requestOrigins = getPermissionRequestOriginsForUrl(currentUrl);
+        if (requestOrigins.length === 0 || !status.currentOriginPattern || !status.canRequestCurrentOrigin) {
           return { granted: false, status };
         }
-        const granted = await browserApi.permissions.request({ origins: [status.currentOriginPattern] });
+        const granted = await browserApi.permissions.request({ origins: requestOrigins });
         return { granted, status: await broadcastPermissionStatus() };
       })
       .then((result: any) => sendResponse(result))
