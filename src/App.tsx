@@ -12,6 +12,7 @@ import {
   ExternalLink,
   FolderOpen,
   Github,
+  Lock,
   Pause,
   Play,
   Plus,
@@ -22,6 +23,7 @@ import {
   X,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
+import type { DetectedMediaEntry, VariantInfo } from '../extension/src/shared/media_classify';
 
 type AppSurface = 'dashboard' | 'popup' | 'options';
 
@@ -59,12 +61,7 @@ interface InterceptionSettings {
   scheduleDays: number[];
 }
 
-interface DetectedStreamItem {
-  url: string;
-  manifestType: string;
-  detectedAt?: number;
-  source?: string;
-}
+type DetectedStreamItem = DetectedMediaEntry;
 
 interface PermissionStatus {
   currentOrigin: string;
@@ -419,6 +416,68 @@ function formatDetectedTimestamp(value: number | undefined) {
   return timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+function normalizeDetectedStreamItem(item: Partial<DetectedStreamItem> | undefined): DetectedStreamItem {
+  return {
+    id: typeof item?.id === 'string' ? item.id : `${item?.kind || 'unknown'}:${item?.url || ''}`,
+    url: typeof item?.url === 'string' ? item.url : '',
+    kind: typeof item?.kind === 'string' ? item.kind : 'unknown',
+    label: typeof item?.label === 'string' ? item.label : 'Detected media',
+    pageUrl: typeof item?.pageUrl === 'string' ? item.pageUrl : '',
+    detectedAt: Number.isFinite(Number(item?.detectedAt)) ? Number(item?.detectedAt) : Date.now(),
+    source: item?.source === 'network' || item?.source === 'page' || item?.source === 'scan' ? item.source : 'page',
+    sizeHint: Number.isFinite(Number(item?.sizeHint)) ? Number(item?.sizeHint) : undefined,
+    manifestType: item?.manifestType === 'HLS' || item?.manifestType === 'DASH' ? item.manifestType : undefined,
+    qualities: Array.isArray(item?.qualities)
+      ? item.qualities
+        .map((variant) => ({
+          id: String(variant?.id || '').trim(),
+          name: typeof variant?.name === 'string' ? variant.name : '',
+          bandwidth: Number.isFinite(Number(variant?.bandwidth)) ? Number(variant?.bandwidth) : undefined,
+          resolution: typeof variant?.resolution === 'string' ? variant.resolution : '',
+          codecs: typeof variant?.codecs === 'string' ? variant.codecs : '',
+          url: typeof variant?.url === 'string' ? variant.url : '',
+        }))
+        .filter((variant) => !!variant.id)
+      : undefined,
+    selectedVariantId: typeof item?.selectedVariantId === 'string' ? item.selectedVariantId : undefined,
+    posterUrl: typeof item?.posterUrl === 'string' ? item.posterUrl : undefined,
+    protected: item?.protected === true,
+    protectedReason: typeof item?.protectedReason === 'string' ? item.protectedReason : undefined,
+  };
+}
+
+function normalizeDetectedStreamList(streams: unknown) {
+  if (!Array.isArray(streams)) {
+    return [] as DetectedStreamItem[];
+  }
+  return streams.map((stream) => normalizeDetectedStreamItem(stream));
+}
+
+function formatVariantLabel(variant: VariantInfo | undefined) {
+  if (!variant) {
+    return 'Default quality';
+  }
+
+  const parts = [
+    variant.name,
+    variant.resolution,
+    Number.isFinite(variant.bandwidth) && variant.bandwidth
+      ? `${Math.round(variant.bandwidth / 1000)} kbps`
+      : '',
+  ].filter(Boolean);
+  return parts.join(' · ') || 'Default quality';
+}
+
+function formatDetectedMediaSource(source: DetectedStreamItem['source']) {
+  if (source === 'network') {
+    return 'network';
+  }
+  if (source === 'scan') {
+    return 'scan';
+  }
+  return 'page';
+}
+
 function formatGrantedOrigin(origin: string) {
   return origin === '<all_urls>' ? 'All sites (<all_urls>)' : origin;
 }
@@ -467,6 +526,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
   const [permissionStatus, setPermissionStatus] = useState<PermissionStatus>(DEFAULT_PERMISSION_STATUS);
   const [permissionNotice, setPermissionNotice] = useState<string | null>(null);
   const [detectedStreams, setDetectedStreams] = useState<DetectedStreamItem[]>([]);
+  const [selectedGrabberVariants, setSelectedGrabberVariants] = useState<Record<string, string>>({});
   const [grabberNotice, setGrabberNotice] = useState<string | null>(null);
   const [isScanningPage, setIsScanningPage] = useState(false);
   const [grabberBusyUrl, setGrabberBusyUrl] = useState<string | null>(null);
@@ -659,7 +719,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
       return;
     }
 
-    setDetectedStreams(Array.isArray(response?.streams) ? response.streams : []);
+    setDetectedStreams(normalizeDetectedStreamList(response?.streams));
     setGrabberNotice(null);
   };
 
@@ -695,6 +755,12 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     void loadInterceptionSettings();
     void loadHostSettings();
   }, []);
+
+  useEffect(() => {
+    setSelectedGrabberVariants((previous) => Object.fromEntries(
+      Object.entries(previous).filter(([entryId]) => detectedStreams.some((stream) => stream.id === entryId)),
+    ));
+  }, [detectedStreams]);
 
   useEffect(() => {
     if (isExtensionRuntimeAvailable()) {
@@ -1004,21 +1070,28 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     await fetch(`/api/downloads/${id}/reveal`, { method: 'POST' });
   };
 
+  const selectedVariantForStream = (stream: DetectedStreamItem) =>
+    selectedGrabberVariants[stream.id] || stream.selectedVariantId || stream.qualities?.[0]?.id || '';
+
   const startVideoDownload = async (stream: DetectedStreamItem) => {
     if (!isExtensionRuntimeAvailable()) {
       setGrabberNotice('Video grabber requires extension runtime.');
       return;
     }
 
-    setGrabberBusyUrl(stream.url);
+    setGrabberBusyUrl(stream.id);
     setGrabberNotice(null);
     try {
-      await sendExtensionMessage({
-        type: 'START_VIDEO_DOWNLOAD',
-        url: stream.url,
-        manifestType: stream.manifestType,
+      const response = await sendExtensionMessage<{ error?: string }>({
+        type: 'START_DETECTED_MEDIA_DOWNLOAD',
+        id: stream.id,
+        selectedVariantId: selectedVariantForStream(stream),
       });
-      setGrabberNotice(`Queued ${stream.manifestType} download.`);
+      if (response?.error) {
+        setGrabberNotice(response.error);
+        return;
+      }
+      setGrabberNotice(`Queued ${stream.label}.`);
       void refreshDownloads();
       void refreshHostStats();
     } catch (error) {
@@ -1031,6 +1104,10 @@ export default function App({ surface = 'dashboard' }: AppProps) {
   const reviewDetectedStream = async (stream: DetectedStreamItem) => {
     if (!isExtensionRuntimeAvailable()) {
       setGrabberNotice('Overlay review requires extension runtime.');
+      return;
+    }
+    if (!stream.manifestType) {
+      setGrabberNotice('Overlay review works only for HLS/DASH manifests.');
       return;
     }
 
@@ -1054,7 +1131,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
 
     setIsScanningPage(true);
     setGrabberNotice(null);
-    const response = await sendExtensionMessage<{ streams?: DetectedStreamItem[]; error?: string }>({ type: 'SCAN_PAGE_VIDEOS' });
+    const response = await sendExtensionMessage<{ streams?: DetectedStreamItem[]; error?: string }>({ type: 'SCAN_PAGE' });
     setIsScanningPage(false);
 
     if (response?.error) {
@@ -1062,9 +1139,9 @@ export default function App({ surface = 'dashboard' }: AppProps) {
       return;
     }
 
-    const streams = Array.isArray(response?.streams) ? response.streams : [];
+    const streams = normalizeDetectedStreamList(response?.streams);
     setDetectedStreams(streams);
-    setGrabberNotice(streams.length > 0 ? null : 'No manifest URLs found on current page.');
+    setGrabberNotice(streams.length > 0 ? null : 'No media URLs found on current page.');
   };
 
   const copyPathToClipboard = async (value: string | undefined) => {
@@ -1644,10 +1721,10 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     <div className="p-6 space-y-4">
       <div className="flex flex-col gap-4 rounded-3xl border border-white/10 bg-[#141414] p-6 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <p className="text-[10px] uppercase tracking-widest font-mono text-white/40">Detected Streams</p>
+          <p className="text-[10px] uppercase tracking-widest font-mono text-white/40">Detected Media</p>
           <h2 className="mt-2 text-xl font-semibold tracking-tight text-white">Video Grabber</h2>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-white/60">
-            Scan current page for HLS or DASH manifests. Grab starts immediately. Review opens in-page overlay for quality selection.
+            Scan current page for manifests, MSE-backed media, and direct files. Pick quality in popup, then queue download.
           </p>
         </div>
         <div className="flex gap-3">
@@ -1664,7 +1741,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
             disabled={isScanningPage}
             className="rounded-xl bg-white px-4 py-2 text-[11px] font-mono uppercase tracking-widest text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {isScanningPage ? 'Scanning...' : 'Scan Page for Videos'}
+            {isScanningPage ? 'Scanning...' : 'Scan Page'}
           </button>
         </div>
       </div>
@@ -1678,39 +1755,90 @@ export default function App({ surface = 'dashboard' }: AppProps) {
       <div className="rounded-3xl border border-white/10 bg-[#111111] p-4">
         {detectedStreams.length === 0 ? (
           <div className="flex min-h-55 flex-col items-center justify-center rounded-2xl border border-dashed border-white/10 bg-white/2 px-6 py-10 text-center">
-            <p className="text-sm font-medium text-white/85">No detected manifests yet</p>
+            <p className="text-sm font-medium text-white/85">No detected media yet</p>
             <p className="mt-2 max-w-md text-sm leading-6 text-white/50">
-              Open page with HLS or DASH player, then run Scan Page for Videos. Network hits also appear here when permission and detection fire.
+              Open page with HLS, DASH, blob/MSE, or direct video, then run Scan Page. Network and page-hook hits appear here after detection fires.
             </p>
           </div>
         ) : (
           <div className="space-y-3">
             {detectedStreams.map((stream) => (
-              <div key={`${stream.manifestType}:${stream.url}`} className="flex flex-col gap-4 rounded-2xl border border-white/10 bg-white/2 px-4 py-4 lg:flex-row lg:items-center lg:justify-between">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-widest text-white/40">
-                    <span>{stream.manifestType}</span>
-                    <span>{stream.source === 'page' ? 'page scan' : 'network'}</span>
-                    <span>{formatDetectedTimestamp(stream.detectedAt)}</span>
+              <div key={stream.id} className="flex flex-col gap-4 rounded-2xl border border-white/10 bg-white/2 px-4 py-4">
+                <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2 text-[10px] font-mono uppercase tracking-widest text-white/40">
+                      <span>{stream.label}</span>
+                      <span>{stream.manifestType || stream.kind}</span>
+                      <span>{formatDetectedMediaSource(stream.source)}</span>
+                      <span>{formatDetectedTimestamp(stream.detectedAt)}</span>
+                      {stream.protected && (
+                        <span className="inline-flex items-center gap-1 rounded-full border border-amber-400/30 bg-amber-400/10 px-2 py-1 text-amber-100">
+                          <Lock className="h-3 w-3" />
+                          DRM
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-2 flex gap-4">
+                      {stream.posterUrl && (
+                        <img
+                          src={stream.posterUrl}
+                          alt=""
+                          className="h-18 w-32 rounded-xl border border-white/10 object-cover"
+                        />
+                      )}
+                      <div className="min-w-0 flex-1 space-y-2">
+                        <div className="truncate text-sm text-white/90" title={stream.url}>{stream.url}</div>
+                        {stream.pageUrl && (
+                          <div className="truncate text-xs text-white/40" title={stream.pageUrl}>{stream.pageUrl}</div>
+                        )}
+                        <div className="flex flex-wrap items-center gap-3 text-xs text-white/50">
+                          {typeof stream.sizeHint === 'number' && stream.sizeHint > 0 && <span>{formatSize(stream.sizeHint)}</span>}
+                          {stream.qualities && stream.qualities.length === 1 && <span>{formatVariantLabel(stream.qualities[0])}</span>}
+                        </div>
+                        {stream.protected && stream.protectedReason && (
+                          <div className="rounded-xl border border-amber-400/20 bg-amber-400/8 px-3 py-2 text-xs text-amber-100">
+                            {stream.protectedReason}
+                          </div>
+                        )}
+                      </div>
+                    </div>
                   </div>
-                  <div className="mt-2 truncate text-sm text-white/90" title={stream.url}>{stream.url}</div>
-                </div>
-                <div className="flex gap-3 lg:flex-none">
-                  <button
-                    type="button"
-                    onClick={() => void reviewDetectedStream(stream)}
-                    className="rounded-xl border border-white/10 px-4 py-2 text-[11px] font-mono uppercase tracking-widest text-white/70 transition-colors hover:border-white/20 hover:text-white"
-                  >
-                    Review
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void startVideoDownload(stream)}
-                    disabled={grabberBusyUrl === stream.url}
-                    className="rounded-xl bg-white px-4 py-2 text-[11px] font-mono uppercase tracking-widest text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {grabberBusyUrl === stream.url ? 'Queueing...' : 'Grab'}
-                  </button>
+                  <div className="flex flex-col gap-3 lg:w-72 lg:flex-none">
+                    {stream.qualities && stream.qualities.length > 1 && (
+                      <select
+                        value={selectedVariantForStream(stream)}
+                        onChange={(event) => setSelectedGrabberVariants((previous) => ({
+                          ...previous,
+                          [stream.id]: event.target.value,
+                        }))}
+                        className="rounded-xl border border-white/10 bg-black/30 px-3 py-2 text-sm text-white outline-none"
+                      >
+                        {stream.qualities.map((variant) => (
+                          <option key={variant.id} value={variant.id}>
+                            {formatVariantLabel(variant)}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                    <div className="flex gap-3">
+                      <button
+                        type="button"
+                        onClick={() => void reviewDetectedStream(stream)}
+                        disabled={!stream.manifestType}
+                        className="rounded-xl border border-white/10 px-4 py-2 text-[11px] font-mono uppercase tracking-widest text-white/70 transition-colors hover:border-white/20 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        Review
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void startVideoDownload(stream)}
+                        disabled={grabberBusyUrl === stream.id || stream.protected}
+                        className="rounded-xl bg-white px-4 py-2 text-[11px] font-mono uppercase tracking-widest text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {grabberBusyUrl === stream.id ? 'Queueing...' : 'Download'}
+                      </button>
+                    </div>
+                  </div>
                 </div>
               </div>
             ))}

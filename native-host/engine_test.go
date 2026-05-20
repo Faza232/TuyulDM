@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -62,6 +64,163 @@ func TestEngineAddFallsBackToRangeProbeAndResolvesRedirects(t *testing.T) {
 	}
 	if got := filepath.Dir(state.OutputPath); got != settings.DownloadDir {
 		t.Fatalf("expected output path in %q, got %q", settings.DownloadDir, state.OutputPath)
+	}
+}
+
+func TestEngineAddFallsBackToPlainGetWhenHeadAndRangeAreRejected(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	body := []byte("plain get probe")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			http.Error(w, "head forbidden", http.StatusForbidden)
+			return
+		}
+		if r.Header.Get("Range") != "" {
+			http.Error(w, "range forbidden", http.StatusForbidden)
+			return
+		}
+
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{
+		URL:      server.URL + "/plain.bin",
+		Filename: "plain.bin",
+		Segments: 4,
+	})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+
+	if state.URL != server.URL+"/plain.bin" {
+		t.Fatalf("expected final URL %q, got %q", server.URL+"/plain.bin", state.URL)
+	}
+	if state.TotalSize != int64(len(body)) {
+		t.Fatalf("expected total size %d, got %d", len(body), state.TotalSize)
+	}
+	if len(state.Segments) != 1 {
+		t.Fatalf("expected single segment when range probe is rejected, got %d", len(state.Segments))
+	}
+}
+
+func TestEngineAddUsesRangeProbeToCaptureValidatorsMissingFromHead(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	body := []byte("validator probe body")
+	digest := md5.Sum(body)
+	etag := "W/\"validator-123\""
+	lastModified := "Tue, 20 May 2026 12:34:56 GMT"
+	var rangeProbeCount int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Header.Get("Range") == "bytes=0-0" {
+			atomic.AddInt32(&rangeProbeCount, 1)
+			w.Header().Set("ETag", etag)
+			w.Header().Set("Last-Modified", lastModified)
+		}
+		handleRangeResponse(w, r, body, digest)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{
+		URL:      server.URL + "/validators.bin",
+		Filename: "validators.bin",
+		Segments: 4,
+	})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&rangeProbeCount); got != 1 {
+		t.Fatalf("expected exactly one range probe, got %d", got)
+	}
+	if state.ETag != etag {
+		t.Fatalf("expected etag %q, got %q", etag, state.ETag)
+	}
+	if state.LastModified != lastModified {
+		t.Fatalf("expected last-modified %q, got %q", lastModified, state.LastModified)
+	}
+	if state.TotalSizeAtAdd != int64(len(body)) {
+		t.Fatalf("expected total size snapshot %d, got %d", len(body), state.TotalSizeAtAdd)
+	}
+	if state.ProbedAt.IsZero() {
+		t.Fatal("expected probed timestamp to be set")
+	}
+
+	persisted, err := storage.GetDownload(state.ID)
+	if err != nil {
+		t.Fatalf("GetDownload returned error: %v", err)
+	}
+	if persisted.ETag != etag {
+		t.Fatalf("expected persisted etag %q, got %q", etag, persisted.ETag)
+	}
+	if persisted.LastModified != lastModified {
+		t.Fatalf("expected persisted last-modified %q, got %q", lastModified, persisted.LastModified)
+	}
+}
+
+func TestEngineAddWarnsWhenValidatorsAreUnavailable(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	body := []byte("no validators")
+	digest := md5.Sum(body)
+	var logBuffer bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuffer, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() {
+		slog.SetDefault(previousLogger)
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		handleRangeResponse(w, r, body, digest)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{
+		URL:      server.URL + "/missing.bin",
+		Filename: "missing.bin",
+		Segments: 4,
+	})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+
+	if state.ETag != "" {
+		t.Fatalf("expected empty etag, got %q", state.ETag)
+	}
+	if state.LastModified != "" {
+		t.Fatalf("expected empty last-modified, got %q", state.LastModified)
+	}
+	if count := strings.Count(logBuffer.String(), "validators_missing"); count != 1 {
+		t.Fatalf("expected one validators_missing warning, got %d logs: %s", count, logBuffer.String())
+	}
+
+	persisted, err := storage.GetDownload(state.ID)
+	if err != nil {
+		t.Fatalf("GetDownload returned error: %v", err)
+	}
+	if persisted.ETag != "" || persisted.LastModified != "" {
+		t.Fatalf("expected persisted validators empty, got etag=%q lastModified=%q", persisted.ETag, persisted.LastModified)
 	}
 }
 
@@ -135,12 +294,22 @@ func TestEngineDownloadRetriesRetryAfter(t *testing.T) {
 	body := []byte(strings.Repeat("retry-after-", 128))
 	digest := md5.Sum(body)
 	var attempts int32
+	logBuffer := setTestLogger(t, slog.LevelWarn)
+	startedAt := time.Now()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-MD5", base64.StdEncoding.EncodeToString(digest[:]))
+			w.Header().Set("ETag", `"retry-after"`)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		if r.Method == http.MethodGet && r.Header.Get("Range") != "" {
 			if atomic.AddInt32(&attempts, 1) == 1 {
-				w.Header().Set("Retry-After", "0")
-				w.WriteHeader(http.StatusServiceUnavailable)
+				w.Header().Set("Retry-After", "5")
+				w.WriteHeader(http.StatusTooManyRequests)
 				return
 			}
 		}
@@ -156,12 +325,122 @@ func TestEngineDownloadRetriesRetryAfter(t *testing.T) {
 		t.Fatalf("Start returned error: %v", err)
 	}
 
-	final := waitForTerminalState(t, storage, state.ID)
+	final := waitForTerminalStateWithin(t, storage, state.ID, 12*time.Second)
 	if final.Status != "finished" {
 		t.Fatalf("expected finished download, got %q (%s)", final.Status, final.Error)
 	}
 	if atomic.LoadInt32(&attempts) < 2 {
 		t.Fatalf("expected at least 2 segment attempts, got %d", atomic.LoadInt32(&attempts))
+	}
+	if elapsed := time.Since(startedAt); elapsed < 5*time.Second {
+		t.Fatalf("expected Retry-After delay of about 5s, got %s", elapsed)
+	}
+	if !strings.Contains(logBuffer.String(), "event=segment_retry") || !strings.Contains(logBuffer.String(), "retry_after_ms=5000") {
+		t.Fatalf("expected segment_retry log with retry_after_ms=5000, got logs: %s", logBuffer.String())
+	}
+}
+
+func TestEngineDownloadFatalHTTP404DoesNotRetry(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	var attempts int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "128")
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("ETag", `"fatal-404"`)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		atomic.AddInt32(&attempts, 1)
+		http.Error(w, "missing", http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{URL: server.URL + "/missing.bin", Filename: "missing.bin", Segments: 1})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if err := engine.Start(state.ID); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+
+	final := waitForTerminalState(t, storage, state.ID)
+	if final.Status != "error" {
+		t.Fatalf("expected error status, got %q", final.Status)
+	}
+	if final.ErrorCode != "fatal_http_404" {
+		t.Fatalf("expected fatal_http_404 error code, got %q", final.ErrorCode)
+	}
+	if atomic.LoadInt32(&attempts) != 1 {
+		t.Fatalf("expected no retries for 404, got %d attempts", atomic.LoadInt32(&attempts))
+	}
+}
+
+func TestEngineDownloadRetriesAfterNetworkStall(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	if err := storage.SaveHostSettings(HostSettings{SegmentStallTimeoutSec: 5}); err != nil {
+		t.Fatalf("SaveHostSettings returned error: %v", err)
+	}
+	engine := NewEngine(storage, nil)
+	body := []byte(strings.Repeat("stall-retry-", 256))
+	digest := md5.Sum(body)
+	var attempts int32
+	logBuffer := setTestLogger(t, slog.LevelWarn)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"stall-etag"`)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-MD5", base64.StdEncoding.EncodeToString(digest[:]))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body[:64])
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-r.Context().Done()
+			return
+		}
+
+		handleRangeResponse(w, r, body, digest)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{URL: server.URL + "/stall.bin", Filename: "stall.bin", Segments: 1})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if err := engine.Start(state.ID); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+
+	final := waitForTerminalStateWithin(t, storage, state.ID, 15*time.Second)
+	if final.Status != "finished" {
+		t.Fatalf("expected finished download after stall retry, got %q (%s)", final.Status, final.Error)
+	}
+	if atomic.LoadInt32(&attempts) < 2 {
+		t.Fatalf("expected stalled download to retry, got %d attempts", atomic.LoadInt32(&attempts))
+	}
+	if !strings.Contains(logBuffer.String(), `network_error="segment stalled"`) {
+		t.Fatalf("expected network stall retry log, got logs: %s", logBuffer.String())
+	}
+
+	downloaded, err := os.ReadFile(final.OutputPath)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if !bytes.Equal(downloaded, body) {
+		t.Fatal("expected stalled download to recover and match source body")
 	}
 }
 
@@ -382,12 +661,12 @@ func TestEngineRemoveQueuedDownloadDeletesRecordAndQueueEntry(t *testing.T) {
 	storage := newTestStorage(t)
 	engine := NewEngine(storage, nil)
 	state := &DownloadState{
-		ID:        "queued-remove",
-		Filename:  "queued.bin",
+		ID:         "queued-remove",
+		Filename:   "queued.bin",
 		OutputPath: filepath.Join(t.TempDir(), "queued.bin"),
-		Status:    "queued",
-		Type:      "file",
-		CreatedAt: time.Now(),
+		Status:     "queued",
+		Type:       "file",
+		CreatedAt:  time.Now(),
 	}
 	if err := storage.SaveDownload(state); err != nil {
 		t.Fatalf("SaveDownload returned error: %v", err)
@@ -651,6 +930,362 @@ func TestEngineShutdownCancelsActiveDownloads(t *testing.T) {
 	}
 }
 
+func TestEngineResumeSendsIfRangeAndCompletesOnValidatorMatch(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	body := []byte(strings.Repeat("resume-match-", 128))
+	digest := md5.Sum(body)
+	etag := `"resume-match-v1"`
+	partialBytes := int64(len(body) / 3)
+	logBuffer := setTestLogger(t, slog.LevelInfo)
+	var sawIfRange atomic.Bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", etag)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+			ifRange := r.Header.Get("If-Range")
+			if ifRange == "" {
+				http.Error(w, "missing If-Range", http.StatusPreconditionFailed)
+				return
+			}
+			if ifRange != etag {
+				http.Error(w, "bad If-Range", http.StatusPreconditionFailed)
+				return
+			}
+			sawIfRange.Store(true)
+		}
+		handleRangeResponse(w, r, body, digest)
+	}))
+	defer server.Close()
+
+	outputPath := filepath.Join(t.TempDir(), "resume-match.bin")
+	writePartialDownloadFile(t, outputPath, body[:partialBytes])
+	state := &DownloadState{
+		ID:             "resume-if-range-match",
+		URL:            server.URL + "/file.bin",
+		Filename:       filepath.Base(outputPath),
+		OutputPath:     outputPath,
+		TotalSize:      int64(len(body)),
+		TotalSizeAtAdd: int64(len(body)),
+		Status:         "paused",
+		Type:           "file",
+		CreatedAt:      time.Now(),
+		ETag:           etag,
+		Segments: []Segment{{
+			Index:   0,
+			Start:   0,
+			End:     int64(len(body)) - 1,
+			Current: partialBytes,
+		}},
+	}
+	if err := storage.SaveDownload(state); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+
+	if err := engine.Resume(state.ID); err != nil {
+		t.Fatalf("Resume returned error: %v", err)
+	}
+
+	final := waitForTerminalState(t, storage, state.ID)
+	if final.Status != "finished" {
+		t.Fatalf("expected finished download, got %q (%s)", final.Status, final.Error)
+	}
+	if !sawIfRange.Load() {
+		t.Fatal("expected resume request to include If-Range")
+	}
+	if !strings.Contains(logBuffer.String(), "if_range_matched=true") {
+		t.Fatalf("expected if_range_matched log entry, got logs: %s", logBuffer.String())
+	}
+
+	downloaded, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if !bytes.Equal(downloaded, body) {
+		t.Fatal("expected resumed file to match source body")
+	}
+}
+
+func TestEngineResumeRemoteChangeRedownloadsFromScratch(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	oldBody := bytes.Repeat([]byte("A"), 8192)
+	newBody := bytes.Repeat([]byte("B"), 8192)
+	newDigest := md5.Sum(newBody)
+	oldETag := `"remote-old"`
+	newETag := `"remote-new"`
+	partialBytes := int64(len(oldBody) / 2)
+	logBuffer := setTestLogger(t, slog.LevelWarn)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", newETag)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(newBody)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Header.Get("Range") != "" && r.Header.Get("If-Range") == oldETag {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(newBody)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(newBody)
+			return
+		}
+		handleRangeResponse(w, r, newBody, newDigest)
+	}))
+	defer server.Close()
+
+	outputPath := filepath.Join(t.TempDir(), "remote-change.bin")
+	writePartialDownloadFile(t, outputPath, oldBody[:partialBytes])
+	state := &DownloadState{
+		ID:             "resume-remote-change",
+		URL:            server.URL + "/file.bin",
+		Filename:       filepath.Base(outputPath),
+		OutputPath:     outputPath,
+		TotalSize:      int64(len(oldBody)),
+		TotalSizeAtAdd: int64(len(oldBody)),
+		Status:         "paused",
+		Type:           "file",
+		CreatedAt:      time.Now(),
+		ETag:           oldETag,
+		Segments: []Segment{{
+			Index:   0,
+			Start:   0,
+			End:     int64(len(oldBody)) - 1,
+			Current: partialBytes,
+		}},
+	}
+	if err := storage.SaveDownload(state); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+
+	if err := engine.Resume(state.ID); err != nil {
+		t.Fatalf("Resume returned error: %v", err)
+	}
+
+	final := waitForTerminalState(t, storage, state.ID)
+	if final.Status != "finished" {
+		t.Fatalf("expected finished download after remote-change recovery, got %q (%s)", final.Status, final.Error)
+	}
+	if final.ETag != newETag {
+		t.Fatalf("expected ETag updated to %q, got %q", newETag, final.ETag)
+	}
+	if !strings.Contains(logBuffer.String(), "remote_changed_recovery") {
+		t.Fatalf("expected remote_changed_recovery logs, got: %s", logBuffer.String())
+	}
+
+	downloaded, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if !bytes.Equal(downloaded, newBody) {
+		t.Fatal("expected full file to be redownloaded after remote change")
+	}
+}
+
+func TestEngineResumeRemoteChangeSizeMismatchFails(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	oldBody := bytes.Repeat([]byte("C"), 4096)
+	newBody := bytes.Repeat([]byte("D"), 2048)
+	oldETag := `"size-old"`
+	newETag := `"size-new"`
+	partialBytes := int64(len(oldBody) / 2)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", newETag)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(newBody)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Header.Get("Range") != "" && r.Header.Get("If-Range") == oldETag {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(newBody)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(newBody)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(newBody)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(newBody)
+	}))
+	defer server.Close()
+
+	outputPath := filepath.Join(t.TempDir(), "remote-size-mismatch.bin")
+	writePartialDownloadFile(t, outputPath, oldBody[:partialBytes])
+	state := &DownloadState{
+		ID:             "resume-remote-size-mismatch",
+		URL:            server.URL + "/file.bin",
+		Filename:       filepath.Base(outputPath),
+		OutputPath:     outputPath,
+		TotalSize:      int64(len(oldBody)),
+		TotalSizeAtAdd: int64(len(oldBody)),
+		Status:         "paused",
+		Type:           "file",
+		CreatedAt:      time.Now(),
+		ETag:           oldETag,
+		Segments: []Segment{{
+			Index:   0,
+			Start:   0,
+			End:     int64(len(oldBody)) - 1,
+			Current: partialBytes,
+		}},
+	}
+	if err := storage.SaveDownload(state); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+
+	if err := engine.Resume(state.ID); err != nil {
+		t.Fatalf("Resume returned error: %v", err)
+	}
+
+	final := waitForTerminalState(t, storage, state.ID)
+	if final.Status != "error" {
+		t.Fatalf("expected remote size mismatch to fail, got %q", final.Status)
+	}
+	if final.ErrorCode != "remote_changed" {
+		t.Fatalf("expected remote_changed error code, got %q", final.ErrorCode)
+	}
+}
+
+func TestEngineResumeRangeNotSatisfiableRetriesFromSegmentStart(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	body := []byte(strings.Repeat("range-reset-", 64))
+	digest := md5.Sum(body)
+	etag := `"range-reset"`
+	segments := buildSegments(int64(len(body)), 2, true)
+	firstLength := segments[0].End - segments[0].Start + 1
+	segments[0].Current = firstLength
+	segments[0].Completed = true
+	segments[1].Current = 5
+	var rangeRequests atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", etag)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Header.Get("Range") != "" {
+			if rangeRequests.Add(1) == 1 {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+		}
+		handleRangeResponse(w, r, body, digest)
+	}))
+	defer server.Close()
+
+	outputPath := filepath.Join(t.TempDir(), "range-reset.bin")
+	writePartialDownloadFile(t, outputPath, body[:segments[1].Start+segments[1].Current])
+	state := &DownloadState{
+		ID:             "resume-range-reset",
+		URL:            server.URL + "/file.bin",
+		Filename:       filepath.Base(outputPath),
+		OutputPath:     outputPath,
+		TotalSize:      int64(len(body)),
+		TotalSizeAtAdd: int64(len(body)),
+		Status:         "paused",
+		Type:           "file",
+		CreatedAt:      time.Now(),
+		ETag:           etag,
+		Segments:       segments,
+	}
+	if err := storage.SaveDownload(state); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+
+	if err := engine.Resume(state.ID); err != nil {
+		t.Fatalf("Resume returned error: %v", err)
+	}
+
+	final := waitForTerminalState(t, storage, state.ID)
+	if final.Status != "finished" {
+		t.Fatalf("expected download to finish after 416 retry, got %q (%s)", final.Status, final.Error)
+	}
+	if got := rangeRequests.Load(); got < 2 {
+		t.Fatalf("expected resumed segment to retry after 416, got %d range requests", got)
+	}
+
+	downloaded, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if !bytes.Equal(downloaded, body) {
+		t.Fatal("expected file to match source body after 416 retry")
+	}
+}
+
+func TestEngineResumeRangeNotSatisfiableTwiceSurfacesRangeUnsupported(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	body := []byte(strings.Repeat("range-unsupported-", 32))
+	etag := `"range-unsupported"`
+	segments := buildSegments(int64(len(body)), 2, true)
+	firstLength := segments[0].End - segments[0].Start + 1
+	segments[0].Current = firstLength
+	segments[0].Completed = true
+	segments[1].Current = 5
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", etag)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Header.Get("Range") != "" {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	outputPath := filepath.Join(t.TempDir(), "range-unsupported.bin")
+	writePartialDownloadFile(t, outputPath, body[:segments[1].Start+segments[1].Current])
+	state := &DownloadState{
+		ID:             "resume-range-unsupported",
+		URL:            server.URL + "/file.bin",
+		Filename:       filepath.Base(outputPath),
+		OutputPath:     outputPath,
+		TotalSize:      int64(len(body)),
+		TotalSizeAtAdd: int64(len(body)),
+		Status:         "paused",
+		Type:           "file",
+		CreatedAt:      time.Now(),
+		ETag:           etag,
+		Segments:       segments,
+	}
+	if err := storage.SaveDownload(state); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+
+	if err := engine.Resume(state.ID); err != nil {
+		t.Fatalf("Resume returned error: %v", err)
+	}
+
+	final := waitForTerminalState(t, storage, state.ID)
+	if final.Status != "error" {
+		t.Fatalf("expected second 416 to fail, got %q", final.Status)
+	}
+	if final.ErrorCode != "range_unsupported" {
+		t.Fatalf("expected range_unsupported error code, got %q", final.ErrorCode)
+	}
+}
+
 func TestEngineResumeAfterIntegrityErrorResetsSegments(t *testing.T) {
 	storage := newTestStorage(t)
 	engine := NewEngine(storage, nil)
@@ -659,12 +1294,12 @@ func TestEngineResumeAfterIntegrityErrorResetsSegments(t *testing.T) {
 	}
 
 	state := &DownloadState{
-		ID:        "integrity-retry",
-		URL:       "https://example.com/file.bin",
-		Filename:  "file.bin",
-		Status:    "error",
-		Type:      "file",
-		CreatedAt: time.Now(),
+		ID:         "integrity-retry",
+		URL:        "https://example.com/file.bin",
+		Filename:   "file.bin",
+		Status:     "error",
+		Type:       "file",
+		CreatedAt:  time.Now(),
 		ContentMD5: "dGVzdA==",
 		Segments: []Segment{
 			{Index: 0, Start: 0, End: 9, Current: 10, Completed: true},
@@ -708,9 +1343,35 @@ func newTestStorage(t *testing.T) *Storage {
 	return storage
 }
 
+func writePartialDownloadFile(t *testing.T, outputPath string, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(outputPath, data, 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+}
+
+func setTestLogger(t *testing.T, level slog.Level) *bytes.Buffer {
+	t.Helper()
+	var buffer bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buffer, &slog.HandlerOptions{Level: level})))
+	t.Cleanup(func() {
+		slog.SetDefault(previousLogger)
+	})
+	return &buffer
+}
+
 func waitForTerminalState(t *testing.T, storage *Storage, id string) DownloadState {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	return waitForTerminalStateWithin(t, storage, id, 5*time.Second)
+}
+
+func waitForTerminalStateWithin(t *testing.T, storage *Storage, id string, timeout time.Duration) DownloadState {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		state, err := storage.GetDownload(id)
 		if err == nil {

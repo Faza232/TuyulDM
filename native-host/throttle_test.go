@@ -64,3 +64,50 @@ func TestThrottledReaderReloadsPerDownloadLimiter(t *testing.T) {
 		t.Fatalf("expected third read to respect updated limiter, got %s", elapsed)
 	}
 }
+
+func TestStallWatchReaderCancelsStalledRead(t *testing.T) {
+	reqCtx, cancel := context.WithCancelCause(context.Background())
+	started := make(chan struct{})
+	reader := newStallWatchReader(reqCtx, &blockingReader{ctx: reqCtx, started: started}, cancel, 50*time.Millisecond)
+	defer reader.Stop()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := reader.Read(make([]byte, 1))
+		done <- err
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for blocking read to start")
+	}
+
+	select {
+	case err := <-done:
+		if downloadErrorCode(err) != "network_stall" {
+			t.Fatalf("expected network_stall read error, got %v", err)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("timed out waiting for stalled read to cancel")
+	}
+
+	if downloadErrorCode(context.Cause(reqCtx)) != "network_stall" {
+		t.Fatalf("expected context cause network_stall, got %v", context.Cause(reqCtx))
+	}
+}
+
+type blockingReader struct {
+	ctx     context.Context
+	started chan struct{}
+}
+
+func (reader *blockingReader) Read(buffer []byte) (int, error) {
+	select {
+	case <-reader.started:
+	default:
+		close(reader.started)
+	}
+	<-reader.ctx.Done()
+	return 0, reader.ctx.Err()
+}

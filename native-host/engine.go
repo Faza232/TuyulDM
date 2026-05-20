@@ -11,6 +11,7 @@ import (
 	"hash"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -55,11 +56,34 @@ type downloadMetadata struct {
 	AcceptRanges bool
 	ContentMD5   string
 	Digest       string
+	ETag         string
+	LastModified string
+}
+
+func (m downloadMetadata) hasValidators() bool {
+	return m.ETag != "" || m.LastModified != ""
+}
+
+func mergeProbeMetadata(primary downloadMetadata, fallback downloadMetadata) downloadMetadata {
+	if primary.ContentMD5 == "" {
+		primary.ContentMD5 = fallback.ContentMD5
+	}
+	if primary.Digest == "" {
+		primary.Digest = fallback.Digest
+	}
+	if primary.ETag == "" {
+		primary.ETag = fallback.ETag
+	}
+	if primary.LastModified == "" {
+		primary.LastModified = fallback.LastModified
+	}
+	return primary
 }
 
 type retryableStatusError struct {
-	StatusCode int
-	RetryAfter time.Duration
+	StatusCode     int
+	RetryAfter     time.Duration
+	UsedRetryAfter bool
 }
 
 func (e *retryableStatusError) Error() string {
@@ -80,6 +104,23 @@ type codedError struct {
 	Err  error
 }
 
+type rangeResumeResetError struct {
+	SegmentIndex int
+}
+
+func (e *rangeResumeResetError) Error() string {
+	return fmt.Sprintf("segment %d resume offset past eof", e.SegmentIndex)
+}
+
+type remoteChangeRecoveryError struct {
+	SegmentIndex  int
+	ContentLength int64
+}
+
+func (e *remoteChangeRecoveryError) Error() string {
+	return fmt.Sprintf("segment %d remote changed during resume", e.SegmentIndex)
+}
+
 func (e *codedError) Error() string {
 	if e.Err == nil {
 		return e.Code
@@ -96,6 +137,16 @@ func withErrorCode(code string, err error) error {
 		return nil
 	}
 	return &codedError{Code: code, Err: err}
+}
+
+func preferredResumeValidator(state *DownloadState) string {
+	if state == nil {
+		return ""
+	}
+	if state.ETag != "" {
+		return state.ETag
+	}
+	return state.LastModified
 }
 
 func clearDownloadFailureState(state *DownloadState) {
@@ -151,21 +202,122 @@ func downloadErrorCode(err error) string {
 	return "download_failed"
 }
 
-func (e *Engine) recordRetryableAttempt(a *ActiveDownload, idx int, requestURL string, attempt int, retryErr *retryableStatusError, event string) {
-	a.mu.Lock()
-	noteDownloadAttempt(a.State, retryErr)
-	snapshot := cloneDownloadState(a.State)
-	a.mu.Unlock()
-
-	e.persistSnapshot(snapshot)
-	slog.Warn(event,
+func segmentRetryLogAttrs(snapshot DownloadState, idx int, requestURL string, attempt int, err error, delay time.Duration) []any {
+	attrs := []any{
 		"download_id", snapshot.ID,
 		"url", requestURL,
 		"attempt", attempt,
 		"segment_index", idx,
-		"retryable_status", retryErr.StatusCode,
-		"retry_after_ms", retryErr.RetryAfter.Milliseconds(),
-	)
+		"event", "segment_retry",
+		"delay_ms", delay.Milliseconds(),
+	}
+
+	var retryErr *retryableStatusError
+	if errors.As(err, &retryErr) {
+		attrs = append(attrs, "retryable_status", retryErr.StatusCode)
+		if retryErr.UsedRetryAfter {
+			attrs = append(attrs, "retry_after_ms", retryErr.RetryAfter.Milliseconds())
+		}
+		return attrs
+	}
+
+	return append(attrs, "network_error", err.Error())
+}
+
+func (e *Engine) recordSegmentRetryAttempt(a *ActiveDownload, idx int, requestURL string, attempt int, err error, delay time.Duration) {
+	a.mu.Lock()
+	noteDownloadAttempt(a.State, err)
+	snapshot := cloneDownloadState(a.State)
+	a.mu.Unlock()
+
+	e.persistSnapshot(snapshot)
+	slog.Warn("segment retry scheduled", segmentRetryLogAttrs(snapshot, idx, requestURL, attempt, err, delay)...)
+}
+
+func (e *Engine) recordRetryableAttempt(a *ActiveDownload, idx int, requestURL string, attempt int, retryErr *retryableStatusError, _ string) {
+	e.recordSegmentRetryAttempt(a, idx, requestURL, attempt, retryErr, retryErr.RetryAfter)
+}
+
+func isRetryableHTTPStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+func isFatalHTTPStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusGone, http.StatusUnavailableForLegalReasons:
+		return true
+	default:
+		return false
+	}
+}
+
+func classifySegmentHTTPError(statusCode int, message string, retryAfterHeader string, attempt int) error {
+	if isRetryableHTTPStatus(statusCode) {
+		delay, usedRetryAfter := retryDelayFromHeader(retryAfterHeader, attempt)
+		return &retryableStatusError{StatusCode: statusCode, RetryAfter: delay, UsedRetryAfter: usedRetryAfter}
+	}
+
+	statusErr := &statusCodeError{StatusCode: statusCode, Message: message}
+	if isFatalHTTPStatus(statusCode) {
+		return withErrorCode(fmt.Sprintf("fatal_http_%d", statusCode), statusErr)
+	}
+	return statusErr
+}
+
+func isRetryableNetworkError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+
+	var coded *codedError
+	if errors.As(err, &coded) && coded.Code == "network_stall" {
+		return true
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	return strings.Contains(strings.ToLower(err.Error()), "tls handshake timeout")
+}
+
+func retryDelayForSegmentError(err error, attempt int) (time.Duration, bool) {
+	var retryErr *retryableStatusError
+	if errors.As(err, &retryErr) {
+		if retryErr.RetryAfter > 0 {
+			return retryErr.RetryAfter, true
+		}
+		return backoffDelay(attempt), true
+	}
+	if isRetryableNetworkError(err) {
+		return backoffDelay(attempt), true
+	}
+	return 0, false
+}
+
+func resolveRequestContextError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	cause := context.Cause(ctx)
+	if cause != nil && !errors.Is(cause, context.Canceled) {
+		return cause
+	}
+	return err
 }
 
 type Engine struct {
@@ -266,23 +418,35 @@ func (e *Engine) Add(ctx context.Context, req DownloadRequest) (*DownloadState, 
 	}
 
 	id := fmt.Sprintf("%d%d", os.Getpid(), time.Now().UnixNano())
+	probedAt := time.Now().UTC()
 	state := &DownloadState{
-		ID:         id,
-		URL:        metadata.FinalURL,
-		TotalSize:  metadata.TotalSize,
-		Status:     "queued",
-		Type:       "file",
-		CreatedAt:  time.Now(),
-		Headers:    headers,
-		Cookies:    cookies,
-		ContentMD5: metadata.ContentMD5,
-		Digest:     metadata.Digest,
-		Segments:   buildSegments(metadata.TotalSize, req.Segments, metadata.AcceptRanges),
-		Schedule:   cloneDownloadSchedule(req.Schedule),
+		ID:             id,
+		URL:            metadata.FinalURL,
+		TotalSize:      metadata.TotalSize,
+		Status:         "queued",
+		Type:           "file",
+		CreatedAt:      time.Now(),
+		Headers:        headers,
+		Cookies:        cookies,
+		ContentMD5:     metadata.ContentMD5,
+		Digest:         metadata.Digest,
+		ETag:           metadata.ETag,
+		LastModified:   metadata.LastModified,
+		TotalSizeAtAdd: metadata.TotalSize,
+		ProbedAt:       probedAt,
+		Segments:       buildSegments(metadata.TotalSize, req.Segments, metadata.AcceptRanges),
+		Schedule:       cloneDownloadSchedule(req.Schedule),
 	}
 
 	if err := e.assignDownloadTargetAndSave(state, req.Filename); err != nil {
 		return nil, err
+	}
+	if !metadata.hasValidators() {
+		slog.Warn("download probe missing validators",
+			"download_id", state.ID,
+			"url", state.URL,
+			"event", "validators_missing",
+		)
 	}
 
 	return state, nil
@@ -372,8 +536,30 @@ func (e *Engine) Start(id string) error {
 }
 
 func (e *Engine) runDownload(a *ActiveDownload) {
-	defer close(a.Done)
-	defer e.persistActiveState(a)
+	restartAfterRemoteChange := false
+	defer func() {
+		if a.File != nil {
+			_ = a.File.Close()
+			a.File = nil
+		}
+		e.persistActiveState(a)
+		close(a.Done)
+		if restartAfterRemoteChange {
+			if err := e.Start(a.State.ID); err != nil {
+				restartErr := withErrorCode("remote_changed", fmt.Errorf("restart after remote change failed: %w", err))
+				state, stateErr := e.storage.GetDownload(a.State.ID)
+				if stateErr != nil {
+					slog.Error("remote change recovery restart failed",
+						"download_id", a.State.ID,
+						"error", restartErr,
+					)
+					return
+				}
+				setDownloadFailureState(state, restartErr)
+				e.persistSnapshot(cloneDownloadState(state))
+			}
+		}
+	}()
 
 	file, err := os.OpenFile(downloadPath(a.State), os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -381,9 +567,6 @@ func (e *Engine) runDownload(a *ActiveDownload) {
 		return
 	}
 	a.File = file
-	defer func() {
-		_ = file.Close()
-	}()
 
 	if a.State.TotalSize > 0 {
 		if err := file.Truncate(a.State.TotalSize); err != nil {
@@ -452,6 +635,32 @@ func (e *Engine) runDownload(a *ActiveDownload) {
 	close(done)
 	_ = file.Sync()
 
+	var remoteRecoveryErr *remoteChangeRecoveryError
+	if errors.As(lastError, &remoteRecoveryErr) {
+		e.releaseActiveSlot(a.State.ID)
+		if a.File != nil {
+			_ = a.File.Close()
+			a.File = nil
+		}
+		if err := e.invalidateAllProgressOnRemoteChange(a); err != nil {
+			a.mu.Lock()
+			setDownloadFailureState(a.State, err)
+			snapshot := cloneDownloadState(a.State)
+			a.mu.Unlock()
+
+			slog.Error("download remote change recovery failed",
+				"download_id", snapshot.ID,
+				"url", snapshot.URL,
+				"error", err,
+				"error_code", snapshot.ErrorCode,
+			)
+			e.persistSnapshot(snapshot)
+			return
+		}
+		restartAfterRemoteChange = true
+		return
+	}
+
 	e.releaseActiveSlot(a.State.ID)
 
 	a.mu.Lock()
@@ -502,31 +711,28 @@ func formatSpeed(bytesPerSec int64) string {
 
 func (e *Engine) downloadSegment(a *ActiveDownload, idx int) error {
 	for attempt := 0; attempt < maxSegmentRetries; attempt++ {
-		err := e.downloadSegmentAttempt(a, idx)
+		err := e.downloadSegmentAttempt(a, idx, attempt)
 		if err == nil {
 			return nil
 		}
 
-		var retryErr *retryableStatusError
-		if errors.As(err, &retryErr) {
+		var resetErr *rangeResumeResetError
+		if errors.As(err, &resetErr) {
+			continue
+		}
+
+		if delay, ok := retryDelayForSegmentError(err, attempt); ok {
 			a.mu.Lock()
 			downloadID := a.State.ID
 			requestURL := a.State.URL
 			a.mu.Unlock()
-			e.recordRetryableAttempt(a, idx, requestURL, attempt+1, retryErr, "segment retry scheduled")
+			e.recordSegmentRetryAttempt(a, idx, requestURL, attempt+1, err, delay)
 			if attempt == maxSegmentRetries-1 {
 				finalErr := withErrorCode(downloadErrorCode(err), fmt.Errorf("segment %d exhausted retries: %w", idx, err))
-				slog.Error("segment exhausted retries",
-					"download_id", downloadID,
-					"url", requestURL,
-					"attempt", attempt+1,
-					"segment_index", idx,
-					"retryable_status", retryErr.StatusCode,
-					"retry_after_ms", retryErr.RetryAfter.Milliseconds(),
-				)
+				slog.Error("segment exhausted retries", segmentRetryLogAttrs(DownloadState{ID: downloadID}, idx, requestURL, attempt+1, err, delay)...)
 				return finalErr
 			}
-			if waitErr := waitForRetry(a.Ctx, retryErr.RetryAfter); waitErr != nil {
+			if waitErr := waitForRetry(a.Ctx, delay); waitErr != nil {
 				return waitErr
 			}
 			continue
@@ -549,14 +755,17 @@ func logForwardedCookieContext(requestURL string, headers map[string]string, coo
 	)
 }
 
-func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int) error {
+func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int, attempt int) error {
+	stallTimeout := time.Duration(e.hostSettingsSnapshot().SegmentStallTimeoutSec) * time.Second
 	a.mu.Lock()
 	seg := a.State.Segments[idx]
 	downloadID := a.State.ID
 	stateURL := a.State.URL
+	totalSize := a.State.TotalSize
 	headers := cloneStringMap(a.State.Headers)
 	cookies := append([]RequestCookie(nil), a.State.Cookies...)
 	segmentCount := len(a.State.Segments)
+	ifRangeValue := preferredResumeValidator(a.State)
 	a.mu.Unlock()
 
 	startOffset := seg.Start + seg.Current
@@ -569,13 +778,17 @@ func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int) error {
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(a.Ctx, http.MethodGet, stateURL, nil)
+	reqCtx, cancel := context.WithCancelCause(a.Ctx)
+	defer cancel(nil)
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, stateURL, nil)
 	if err != nil {
 		return err
 	}
 	applyRequestHeaders(req, headers, cookies)
 
 	rangeRequested := false
+	ifRangeRequested := false
 	switch {
 	case seg.End >= 0 && (segmentCount > 1 || seg.Current > 0):
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", startOffset, seg.End))
@@ -584,21 +797,75 @@ func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int) error {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", startOffset))
 		rangeRequested = true
 	}
+	if rangeRequested && seg.Current > 0 && ifRangeValue != "" {
+		req.Header.Set("If-Range", ifRangeValue)
+		ifRangeRequested = true
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return resolveRequestContextError(reqCtx, err)
 	}
 	defer resp.Body.Close()
-	reader := newThrottledReader(a.Ctx, resp.Body, &a.PerDownloadLimiter, e.globalLimiterSnapshot())
-
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
-		return &retryableStatusError{StatusCode: resp.StatusCode, RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
-	}
+	stallReader := newStallWatchReader(reqCtx, resp.Body, cancel, stallTimeout)
+	defer stallReader.Stop()
+	reader := newThrottledReader(reqCtx, stallReader, &a.PerDownloadLimiter, e.globalLimiterSnapshot())
 
 	switch {
+	case rangeRequested && resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
+		if seg.Current > 0 {
+			a.mu.Lock()
+			a.State.Segments[idx].Current = 0
+			a.State.Segments[idx].Completed = false
+			a.mu.Unlock()
+
+			slog.Warn("segment resume offset past eof; retrying from start",
+				"download_id", downloadID,
+				"url", stateURL,
+				"segment_index", idx,
+				"event", "segment_resume_reset",
+			)
+			return &rangeResumeResetError{SegmentIndex: idx}
+		}
+
+		err := withErrorCode("range_unsupported", &statusCodeError{StatusCode: resp.StatusCode, Message: "range not satisfiable"})
+		slog.Error("segment range request not satisfiable",
+			"download_id", downloadID,
+			"url", stateURL,
+			"segment_index", idx,
+			"status_code", resp.StatusCode,
+		)
+		return err
+	case ifRangeRequested && resp.StatusCode == http.StatusOK:
+		if totalSize > 0 && resp.ContentLength > 0 && resp.ContentLength != totalSize {
+			err := withErrorCode("remote_changed", fmt.Errorf("remote file size changed during resume: expected %d, got %d", totalSize, resp.ContentLength))
+			slog.Warn("segment resume detected remote size change",
+				"download_id", downloadID,
+				"url", stateURL,
+				"segment_index", idx,
+				"status_code", resp.StatusCode,
+				"content_length", resp.ContentLength,
+				"expected_total_size", totalSize,
+				"event", "remote_changed_recovery",
+			)
+			return err
+		}
+
+		slog.Warn("segment resume detected remote change",
+			"download_id", downloadID,
+			"url", stateURL,
+			"segment_index", idx,
+			"status_code", resp.StatusCode,
+			"content_length", resp.ContentLength,
+			"event", "remote_changed_recovery",
+		)
+		return &remoteChangeRecoveryError{SegmentIndex: idx, ContentLength: resp.ContentLength}
 	case rangeRequested && resp.StatusCode != http.StatusPartialContent:
-		err := &statusCodeError{StatusCode: resp.StatusCode, Message: "range request returned status"}
+		err := classifySegmentHTTPError(resp.StatusCode, "range request returned status", resp.Header.Get("Retry-After"), attempt)
+		var retryErr *retryableStatusError
+		if errors.As(err, &retryErr) {
+			return err
+		}
 		slog.Error("segment range request failed",
 			"download_id", downloadID,
 			"url", stateURL,
@@ -607,7 +874,11 @@ func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int) error {
 		)
 		return err
 	case !rangeRequested && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent:
-		err := &statusCodeError{StatusCode: resp.StatusCode, Message: "unexpected status code"}
+		err := classifySegmentHTTPError(resp.StatusCode, "unexpected status code", resp.Header.Get("Retry-After"), attempt)
+		var retryErr *retryableStatusError
+		if errors.As(err, &retryErr) {
+			return err
+		}
 		slog.Error("segment request failed",
 			"download_id", downloadID,
 			"url", stateURL,
@@ -615,6 +886,16 @@ func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int) error {
 			"status_code", resp.StatusCode,
 		)
 		return err
+	}
+
+	if ifRangeRequested && resp.StatusCode == http.StatusPartialContent {
+		slog.Info("segment resume validator matched",
+			"download_id", downloadID,
+			"url", stateURL,
+			"segment_index", idx,
+			"event", "segment_resume",
+			"if_range_matched", true,
+		)
 	}
 
 	writeOffset := startOffset
@@ -640,9 +921,95 @@ func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int) error {
 			if readErr == io.EOF {
 				return e.completeSegment(a, idx)
 			}
-			return readErr
+			return resolveRequestContextError(reqCtx, readErr)
 		}
 	}
+}
+
+func (e *Engine) invalidateAllProgressOnRemoteChange(a *ActiveDownload) error {
+	a.Cancel()
+
+	a.mu.Lock()
+	downloadID := a.State.ID
+	requestURL := a.State.URL
+	requestHeaders := cloneStringMap(a.State.Headers)
+	requestCookies := append([]RequestCookie(nil), a.State.Cookies...)
+	requestedSegments := len(a.State.Segments)
+	previousSize := a.State.TotalSize
+	outputPath := downloadPath(a.State)
+	resetSegmentsForRetry(a.State)
+	a.State.Status = "queued"
+	a.State.WasUserPaused = false
+	clearDownloadFailureState(a.State)
+	setDownloadSpeed(a.State, 0)
+	a.mu.Unlock()
+
+	slog.Warn("remote change recovery resetting progress",
+		"download_id", downloadID,
+		"url", requestURL,
+		"event", "remote_changed_recovery",
+		"action", "reset_segments",
+	)
+
+	if strings.TrimSpace(outputPath) != "" {
+		if info, err := os.Stat(outputPath); err == nil && info.Size() > 0 {
+			slog.Warn("remote change recovery removing output",
+				"download_id", downloadID,
+				"url", requestURL,
+				"output_path", outputPath,
+				"event", "remote_changed_recovery",
+				"action", "remove_output",
+			)
+			if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
+				return withErrorCode("remote_changed", err)
+			}
+		}
+	}
+
+	probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	meta, err := e.probeDownload(probeCtx, requestURL, requestHeaders, requestCookies)
+	if err != nil {
+		return withErrorCode("remote_changed", fmt.Errorf("re-probe after remote change failed: %w", err))
+	}
+	if previousSize > 0 && meta.TotalSize > 0 && meta.TotalSize != previousSize {
+		return withErrorCode("remote_changed", fmt.Errorf("remote file size changed from %d to %d", previousSize, meta.TotalSize))
+	}
+
+	recoveredSize := previousSize
+	if meta.TotalSize > 0 {
+		recoveredSize = meta.TotalSize
+	}
+	if requestedSegments < 1 {
+		requestedSegments = 1
+	}
+
+	a.mu.Lock()
+	a.State.URL = meta.FinalURL
+	a.State.TotalSize = recoveredSize
+	a.State.ContentMD5 = meta.ContentMD5
+	a.State.Digest = meta.Digest
+	a.State.ETag = meta.ETag
+	a.State.LastModified = meta.LastModified
+	a.State.Segments = buildSegments(recoveredSize, requestedSegments, meta.AcceptRanges)
+	a.State.Progress = 0
+	a.State.Status = "queued"
+	a.State.WasUserPaused = false
+	clearDownloadFailureState(a.State)
+	setDownloadSpeed(a.State, 0)
+	a.mu.Unlock()
+
+	slog.Warn("remote change recovery prepared restart",
+		"download_id", downloadID,
+		"url", meta.FinalURL,
+		"total_size", recoveredSize,
+		"accept_ranges", meta.AcceptRanges,
+		"event", "remote_changed_recovery",
+		"action", "restart",
+	)
+
+	return nil
 }
 
 func (e *Engine) completeSegment(a *ActiveDownload, idx int) error {
@@ -847,13 +1214,18 @@ func (e *Engine) probeDownload(ctx context.Context, downloadURL string, headers 
 	headStatus := headResp.StatusCode
 	_ = headResp.Body.Close()
 
-	if headStatus == http.StatusOK && headMeta.TotalSize > 0 && headMeta.AcceptRanges {
+	if headStatus == http.StatusOK && headMeta.TotalSize > 0 && headMeta.AcceptRanges && headMeta.hasValidators() {
 		return headMeta, nil
 	}
 
+	plainGetStartURL := finalURL
+	rangeStatus := 0
 	rangeResp, rangeURL, rangeErr := doRequestWithRedirects(ctx, http.MethodGet, finalURL, headers, cookies, func(req *http.Request) {
 		req.Header.Set("Range", "bytes=0-0")
 	})
+	if rangeURL != "" {
+		plainGetStartURL = rangeURL
+	}
 	if rangeErr != nil {
 		if headStatus == http.StatusOK && headMeta.TotalSize > 0 {
 			return headMeta, nil
@@ -863,29 +1235,42 @@ func (e *Engine) probeDownload(ctx context.Context, downloadURL string, headers 
 			"head_status_code", headStatus,
 			"error", rangeErr,
 		)
-		return downloadMetadata{}, rangeErr
+	} else {
+		defer rangeResp.Body.Close()
+		rangeStatus = rangeResp.StatusCode
+		rangeMeta := mergeProbeMetadata(metadataFromResponse(rangeURL, rangeResp), headMeta)
+		switch rangeResp.StatusCode {
+		case http.StatusPartialContent, http.StatusOK:
+			return rangeMeta, nil
+		default:
+			if headStatus == http.StatusOK && headMeta.TotalSize > 0 {
+				return headMeta, nil
+			}
+			slog.Warn("download probe rejected",
+				"url", rangeURL,
+				"head_status_code", headStatus,
+				"status_code", rangeResp.StatusCode,
+			)
+		}
 	}
-	defer rangeResp.Body.Close()
 
-	rangeMeta := metadataFromResponse(rangeURL, rangeResp)
-	switch rangeResp.StatusCode {
-	case http.StatusPartialContent, http.StatusOK:
-		if rangeMeta.ContentMD5 == "" {
-			rangeMeta.ContentMD5 = headMeta.ContentMD5
-		}
-		if rangeMeta.Digest == "" {
-			rangeMeta.Digest = headMeta.Digest
-		}
-		return rangeMeta, nil
+	plainResp, plainURL, plainErr := doRequestWithRedirects(ctx, http.MethodGet, plainGetStartURL, headers, cookies, nil)
+	if plainErr != nil {
+		return downloadMetadata{}, plainErr
+	}
+	defer plainResp.Body.Close()
+
+	plainMeta := mergeProbeMetadata(metadataFromResponse(plainURL, plainResp), headMeta)
+	switch plainResp.StatusCode {
+	case http.StatusOK, http.StatusPartialContent:
+		return plainMeta, nil
 	default:
-		if headStatus == http.StatusOK && headMeta.TotalSize > 0 {
-			return headMeta, nil
-		}
-		err := &statusCodeError{StatusCode: rangeResp.StatusCode, Message: "metadata probe returned status"}
-		slog.Warn("download probe rejected",
-			"url", rangeURL,
+		err := &statusCodeError{StatusCode: plainResp.StatusCode, Message: "metadata probe returned status"}
+		slog.Warn("download probe plain get rejected",
+			"url", plainURL,
 			"head_status_code", headStatus,
-			"status_code", rangeResp.StatusCode,
+			"range_status_code", rangeStatus,
+			"status_code", plainResp.StatusCode,
 		)
 		return downloadMetadata{}, err
 	}
@@ -993,6 +1378,8 @@ func metadataFromResponse(finalURL string, resp *http.Response) downloadMetadata
 		AcceptRanges: acceptRanges,
 		ContentMD5:   strings.TrimSpace(resp.Header.Get("Content-MD5")),
 		Digest:       strings.TrimSpace(resp.Header.Get("Digest")),
+		ETag:         resp.Header.Get("ETag"),
+		LastModified: resp.Header.Get("Last-Modified"),
 	}
 }
 
@@ -1047,23 +1434,6 @@ func waitForRetry(ctx context.Context, duration time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
-}
-
-func parseRetryAfter(value string) time.Duration {
-	trimmed := strings.TrimSpace(value)
-	if trimmed == "" {
-		return time.Second
-	}
-
-	if seconds, err := time.ParseDuration(trimmed + "s"); err == nil {
-		return seconds
-	}
-
-	if retryAt, err := http.ParseTime(trimmed); err == nil {
-		return time.Until(retryAt)
-	}
-
-	return time.Second
 }
 
 func buildSegments(totalSize int64, requestedSegments int, canSegment bool) []Segment {
@@ -1443,10 +1813,10 @@ func (e *Engine) startQueuedDownload(id string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	settings := e.hostSettingsSnapshot()
 	active := &ActiveDownload{
-		State:              state,
-		Ctx:                ctx,
-		Cancel:             cancel,
-		Done:               make(chan struct{}),
+		State:  state,
+		Ctx:    ctx,
+		Cancel: cancel,
+		Done:   make(chan struct{}),
 	}
 	active.PerDownloadLimiter.Store(newRateLimiter(settings.PerDownloadThrottleBytesPerSecond))
 

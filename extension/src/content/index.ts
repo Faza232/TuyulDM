@@ -1,12 +1,16 @@
+import {
+  PAGE_HOOK_MESSAGE_TYPE,
+  classifyMediaCandidate,
+  normalizeMediaUrl,
+  shouldReportMediaCandidate,
+  type PageHookPayload,
+  type ScanPayload,
+} from '../shared/media_classify';
+
 type OverlayDownloadSchedule = {
   start_hour: number;
   end_hour: number;
   days: number[];
-};
-
-type DetectedManifest = {
-  url: string;
-  manifestType: 'HLS' | 'DASH';
 };
 
 type RuntimeLike = {
@@ -71,20 +75,6 @@ function sendRuntimeMessage(message: Record<string, unknown>) {
   });
 }
 
-function detectManifestTypeFromUrl(rawUrl: unknown): DetectedManifest['manifestType'] | null {
-  const url = String(rawUrl || '').trim().toLowerCase();
-  if (!url) {
-    return null;
-  }
-  if (url.includes('.m3u8')) {
-    return 'HLS';
-  }
-  if (url.includes('.mpd')) {
-    return 'DASH';
-  }
-  return null;
-}
-
 function normalizeScheduleHour(value: number) {
   if (!Number.isFinite(value)) {
     return 0;
@@ -129,36 +119,92 @@ function drmPolicyUrl() {
   return runtime?.getURL ? runtime.getURL(DRM_POLICY_HASH) : '#';
 }
 
-function scanPageForVideos(): DetectedManifest[] {
-  const found = new Map<string, DetectedManifest>();
-  const remember = (candidate: unknown) => {
-    const url = String(candidate || '').trim();
-    const manifestType = detectManifestTypeFromUrl(url);
-    if (!url || !manifestType) {
-      return;
-    }
-    found.set(`${manifestType}:${url}`, { url, manifestType });
-  };
+function currentFrameUrl() {
+  return window.location.href;
+}
 
-  for (const element of document.querySelectorAll('video, source')) {
-    if (element instanceof HTMLMediaElement) {
-      remember(element.currentSrc);
-      remember(element.src);
-      remember(element.getAttribute('src'));
+function buildScanCandidate(url: unknown, extra: Partial<ScanPayload> = {}): ScanPayload | null {
+  const normalizedUrl = normalizeMediaUrl(url);
+  if (!normalizedUrl) {
+    return null;
+  }
+
+  const candidate: ScanPayload = {
+    event: 'scan',
+    url: normalizedUrl,
+    frameUrl: currentFrameUrl(),
+    ...extra,
+  };
+  return shouldReportMediaCandidate(candidate) ? candidate : null;
+}
+
+function collectShadowRoots(root: Document | ShadowRoot, output: ShadowRoot[]) {
+  for (const element of root.querySelectorAll('*')) {
+    const host = element as HTMLElement & { shadowRoot?: ShadowRoot | null };
+    if (!host.shadowRoot) {
       continue;
     }
+    output.push(host.shadowRoot);
+    collectShadowRoots(host.shadowRoot, output);
+  }
+}
 
-    if (element instanceof HTMLSourceElement) {
-      remember(element.src);
-      remember(element.getAttribute('src'));
+function scanPageForVideos() {
+  const found = new Map<string, ScanPayload>();
+  const remember = (candidate: ScanPayload | null) => {
+    if (!candidate) {
+      return;
+    }
+    found.set(candidate.url, candidate);
+  };
+  const roots: Array<Document | ShadowRoot> = [document];
+  collectShadowRoots(document, roots as ShadowRoot[]);
+
+  for (const root of roots) {
+    for (const element of root.querySelectorAll('video, audio, source')) {
+      if (element instanceof HTMLVideoElement || element instanceof HTMLAudioElement) {
+        const posterUrl = element instanceof HTMLVideoElement ? element.poster || '' : '';
+        remember(buildScanCandidate(element.currentSrc, { posterUrl }));
+        remember(buildScanCandidate(element.src, { posterUrl }));
+        remember(buildScanCandidate(element.getAttribute('src'), {
+          contentType: element.getAttribute('type') || '',
+          posterUrl,
+        }));
+        continue;
+      }
+
+      if (element instanceof HTMLSourceElement) {
+        remember(buildScanCandidate(element.src, { contentType: element.type || '' }));
+        remember(buildScanCandidate(element.getAttribute('src'), { contentType: element.type || '' }));
+      }
     }
   }
 
   for (const entry of performance.getEntriesByType('resource')) {
-    remember((entry as PerformanceResourceTiming).name);
+    remember(buildScanCandidate((entry as PerformanceResourceTiming).name));
   }
 
-  return Array.from(found.values());
+  return Array.from(found.values()).filter((candidate) => classifyMediaCandidate(candidate).kind !== 'unknown');
+}
+
+function installPageHookBridge() {
+  window.addEventListener('message', (event: MessageEvent) => {
+    if (event.source !== window || !event.data || event.data.type !== PAGE_HOOK_MESSAGE_TYPE) {
+      return;
+    }
+
+    const payload = event.data.payload as PageHookPayload | undefined;
+    if (!payload) {
+      return;
+    }
+
+    void sendRuntimeMessage({
+      type: 'PAGE_HOOK_EVENT',
+      payload,
+    }).catch(() => {
+      // Ignore transient runtime disconnects.
+    });
+  });
 }
 
 function removeOverlayHost() {
@@ -584,8 +630,8 @@ function installMessageListener() {
       return false;
     }
 
-    if (message?.type === 'SCAN_PAGE_VIDEOS') {
-      sendResponse({ streams: scanPageForVideos() });
+    if (message?.type === 'SCAN_PAGE' || message?.type === 'SCAN_PAGE_VIDEOS') {
+      sendResponse({ candidates: scanPageForVideos() });
       return false;
     }
 
@@ -595,6 +641,7 @@ function installMessageListener() {
 
 if (!window.__TUYULDM_CONTENT_READY__) {
   window.__TUYULDM_CONTENT_READY__ = true;
+  installPageHookBridge();
   installMessageListener();
 }
 

@@ -11,32 +11,36 @@ import (
 )
 
 type DownloadState struct {
-	ID                string            `json:"id"`
-	URL               string            `json:"url"`
-	Filename          string            `json:"filename"`
-	OutputPath        string            `json:"output_path,omitempty"`
-	TotalSize         int64             `json:"total_size"`
-	Status            string            `json:"status"`
-	Progress          float64           `json:"progress"`
-	Speed             string            `json:"speed"`
-	SpeedBytesPerSecond int64           `json:"speed_bytes_per_second,omitempty"`
-	Type              string            `json:"type"` // "file" or "video"
-	Error             string            `json:"error,omitempty"`
-	ErrorCode         string            `json:"error_code,omitempty"`
-	LastAttemptAt     time.Time         `json:"last_attempt_at,omitempty"`
-	CreatedAt         time.Time         `json:"created_at"`
-	Headers           map[string]string `json:"headers,omitempty"`
-	Cookies           []RequestCookie   `json:"cookies,omitempty"`
-	ContentMD5        string            `json:"content_md5,omitempty"`
-	Digest            string            `json:"digest,omitempty"`
-	ManifestType      string            `json:"manifest_type,omitempty"`
-	SelectedVariantID string            `json:"selected_variant_id,omitempty"`
-	VideoContainer    string            `json:"video_container,omitempty"`
-	Parallelism       int               `json:"parallelism,omitempty"`
-	Variants          []VideoVariant    `json:"variants,omitempty"`
-	Segments          []Segment         `json:"segments"`
-	Schedule          *DownloadSchedule `json:"schedule,omitempty"`
-	WasUserPaused     bool              `json:"was_user_paused,omitempty"`
+	ID                  string            `json:"id"`
+	URL                 string            `json:"url"`
+	Filename            string            `json:"filename"`
+	OutputPath          string            `json:"output_path,omitempty"`
+	TotalSize           int64             `json:"total_size"`
+	Status              string            `json:"status"`
+	Progress            float64           `json:"progress"`
+	Speed               string            `json:"speed"`
+	SpeedBytesPerSecond int64             `json:"speed_bytes_per_second,omitempty"`
+	Type                string            `json:"type"` // "file" or "video"
+	Error               string            `json:"error,omitempty"`
+	ErrorCode           string            `json:"error_code,omitempty"`
+	LastAttemptAt       time.Time         `json:"last_attempt_at,omitempty"`
+	CreatedAt           time.Time         `json:"created_at"`
+	Headers             map[string]string `json:"headers,omitempty"`
+	Cookies             []RequestCookie   `json:"cookies,omitempty"`
+	ContentMD5          string            `json:"content_md5,omitempty"`
+	Digest              string            `json:"digest,omitempty"`
+	ETag                string            `json:"etag,omitempty"`
+	LastModified        string            `json:"lastModified,omitempty"`
+	TotalSizeAtAdd      int64             `json:"totalSizeAtAdd,omitempty"`
+	ProbedAt            time.Time         `json:"probedAt,omitempty"`
+	ManifestType        string            `json:"manifest_type,omitempty"`
+	SelectedVariantID   string            `json:"selected_variant_id,omitempty"`
+	VideoContainer      string            `json:"video_container,omitempty"`
+	Parallelism         int               `json:"parallelism,omitempty"`
+	Variants            []VideoVariant    `json:"variants,omitempty"`
+	Segments            []Segment         `json:"segments"`
+	Schedule            *DownloadSchedule `json:"schedule,omitempty"`
+	WasUserPaused       bool              `json:"was_user_paused,omitempty"`
 }
 
 type DownloadSchedule struct {

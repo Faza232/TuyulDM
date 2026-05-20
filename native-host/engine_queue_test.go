@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"crypto/md5"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -31,6 +31,7 @@ func TestEngineQueuesDownloadsByConcurrencyCap(t *testing.T) {
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 			w.Header().Set("Accept-Ranges", "bytes")
 			w.Header().Set("Content-MD5", base64.StdEncoding.EncodeToString(digest[:]))
+			w.Header().Set("ETag", `"queue-test"`)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -141,6 +142,7 @@ func TestEngineShutdownDoesNotStartQueuedDownloads(t *testing.T) {
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 			w.Header().Set("Accept-Ranges", "bytes")
 			w.Header().Set("Content-MD5", base64.StdEncoding.EncodeToString(digest[:]))
+			w.Header().Set("ETag", `"shutdown-queue-test"`)
 			w.WriteHeader(http.StatusOK)
 			return
 		}

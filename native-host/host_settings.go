@@ -5,20 +5,25 @@ import "strings"
 const (
 	defaultMaxConcurrentDownloads = 3
 	maxConcurrentDownloadsLimit   = 32
+	defaultSegmentStallTimeoutSec = 30
+	minSegmentStallTimeoutSec     = 5
+	maxSegmentStallTimeoutSec     = 600
 )
 
 type HostSettings struct {
-	MaxConcurrentDownloads            int   `json:"maxConcurrentDownloads"`
-	GlobalThrottleBytesPerSecond      int64 `json:"globalThrottleBytesPerSecond"`
-	PerDownloadThrottleBytesPerSecond int64 `json:"perDownloadThrottleBytesPerSecond"`
+	MaxConcurrentDownloads            int    `json:"maxConcurrentDownloads"`
+	GlobalThrottleBytesPerSecond      int64  `json:"globalThrottleBytesPerSecond"`
+	PerDownloadThrottleBytesPerSecond int64  `json:"perDownloadThrottleBytesPerSecond"`
+	SegmentStallTimeoutSec            int    `json:"segmentStallTimeoutSec"`
 	DownloadDir                       string `json:"downloadDir"`
 	LogLevel                          string `json:"logLevel"`
 }
 
 type HostSettingsUpdate struct {
-	MaxConcurrentDownloads            *int   `json:"maxConcurrentDownloads,omitempty"`
-	GlobalThrottleBytesPerSecond      *int64 `json:"globalThrottleBytesPerSecond,omitempty"`
-	PerDownloadThrottleBytesPerSecond *int64 `json:"perDownloadThrottleBytesPerSecond,omitempty"`
+	MaxConcurrentDownloads            *int    `json:"maxConcurrentDownloads,omitempty"`
+	GlobalThrottleBytesPerSecond      *int64  `json:"globalThrottleBytesPerSecond,omitempty"`
+	PerDownloadThrottleBytesPerSecond *int64  `json:"perDownloadThrottleBytesPerSecond,omitempty"`
+	SegmentStallTimeoutSec            *int    `json:"segmentStallTimeoutSec,omitempty"`
 	DownloadDir                       *string `json:"downloadDir,omitempty"`
 	LogLevel                          *string `json:"logLevel,omitempty"`
 }
@@ -26,6 +31,7 @@ type HostSettingsUpdate struct {
 func defaultHostSettings() HostSettings {
 	return HostSettings{
 		MaxConcurrentDownloads: defaultMaxConcurrentDownloads,
+		SegmentStallTimeoutSec: defaultSegmentStallTimeoutSec,
 		LogLevel:               defaultHostLogLevel,
 	}
 }
@@ -43,6 +49,15 @@ func normalizeHostSettings(settings HostSettings) HostSettings {
 	if settings.PerDownloadThrottleBytesPerSecond < 0 {
 		settings.PerDownloadThrottleBytesPerSecond = 0
 	}
+	if settings.SegmentStallTimeoutSec <= 0 {
+		settings.SegmentStallTimeoutSec = defaultSegmentStallTimeoutSec
+	}
+	if settings.SegmentStallTimeoutSec < minSegmentStallTimeoutSec {
+		settings.SegmentStallTimeoutSec = minSegmentStallTimeoutSec
+	}
+	if settings.SegmentStallTimeoutSec > maxSegmentStallTimeoutSec {
+		settings.SegmentStallTimeoutSec = maxSegmentStallTimeoutSec
+	}
 	settings.DownloadDir = strings.TrimSpace(settings.DownloadDir)
 	settings.LogLevel = normalizeHostLogLevel(settings.LogLevel)
 	return settings
@@ -57,6 +72,9 @@ func applyHostSettingsUpdate(current HostSettings, update HostSettingsUpdate) Ho
 	}
 	if update.PerDownloadThrottleBytesPerSecond != nil {
 		current.PerDownloadThrottleBytesPerSecond = *update.PerDownloadThrottleBytesPerSecond
+	}
+	if update.SegmentStallTimeoutSec != nil {
+		current.SegmentStallTimeoutSec = *update.SegmentStallTimeoutSec
 	}
 	if update.DownloadDir != nil {
 		current.DownloadDir = *update.DownloadDir

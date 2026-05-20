@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "build": "vite build",
-    "build:firefox": "TARGET_BROWSER=firefox vite build",
+    "build": "npm run clean && vite build",
+    "build:firefox": "npm run clean && TARGET_BROWSER=firefox vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit"

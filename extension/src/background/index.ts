@@ -1,4 +1,18 @@
 import browser from 'webextension-polyfill';
+import {
+  MEDIA_BUFFER_TTL_MS,
+  classifyMediaCandidate,
+  getUrlOrigin,
+  isBlobUrl,
+  mediaIdForCandidate,
+  normalizeMediaUrl,
+  type DetectedMediaEntry,
+  type ManifestType,
+  type MediaCandidate,
+  type PageHookPayload,
+  type ScanPayload,
+  type VariantInfo,
+} from '../shared/media_classify';
 
 const browserApi = browser as any;
 const HOST_NAME = 'com.tuyuldm.daemon';
@@ -26,7 +40,7 @@ const FORWARDED_HEADERS = new Map([
   ['referer', 'Referer'],
   ['user-agent', 'User-Agent'],
 ]);
-const DETECTED_STREAM_TTL_MS = 5 * 60_000;
+const DETECTED_MEDIA_TTL_MS = 5 * 60_000;
 
 type OverlayDownloadSchedule = {
   start_hour: number;
@@ -34,11 +48,20 @@ type OverlayDownloadSchedule = {
   days: number[];
 };
 
-type DetectedStreamEntry = {
-  url: string;
-  manifestType: 'HLS' | 'DASH';
+type RecentMediaCandidate = {
+  candidate: MediaCandidate;
   detectedAt: number;
-  source: 'network' | 'page';
+};
+
+type TabDetectionState = {
+  pageUrl: string;
+  entries: DetectedMediaEntry[];
+  manifestByOrigin: Map<string, ManifestType>;
+  recentByFrame: Map<string, RecentMediaCandidate[]>;
+  blobBackings: Map<string, MediaCandidate>;
+  lastMseMimeByFrame: Map<string, string>;
+  bufferedCandidates: RecentMediaCandidate[];
+  pendingInspectIds: Set<string>;
 };
 
 type PermissionStatusPayload = {
@@ -55,7 +78,7 @@ let port: any | null = null;
 const activeDownloads = new Set<string>();
 const recentRequestHeaders = new Map<string, { headers: Record<string, string>; expiresAt: number }>();
 const pendingRequests = new Map<number, { resolve: (response: any) => void; reject: (error: Error) => void }>();
-const detectedStreamsByTab = new Map<number, DetectedStreamEntry[]>();
+const detectedMediaByTab = new Map<number, TabDetectionState>();
 let nextRequestId = 10_000;
 let hostStatus = {
   connected: false,
@@ -155,61 +178,362 @@ async function setPermissionOnboardingDismissed(value: boolean) {
   await browserApi.storage.local.set({ [PERMISSION_ONBOARDING_DISMISSED_KEY]: value });
 }
 
-function normalizeManifestType(value: unknown): DetectedStreamEntry['manifestType'] | '' {
-  const normalized = String(value || '').trim().toUpperCase();
-  if (normalized === 'HLS' || normalized === 'DASH') {
-    return normalized;
-  }
-  return '';
-}
-
 function getContentScriptFiles() {
   const manifest = browserApi.runtime.getManifest();
-  const scripts = manifest.content_scripts?.[0]?.js;
+  const scripts = manifest.content_scripts?.find((entry: any) => entry?.js?.includes('extension/src/content/index.ts'))?.js;
   return Array.isArray(scripts) ? scripts : [];
 }
 
-function pruneDetectedStreams(tabId?: number) {
-  const now = Date.now();
-  const pruneEntries = (entries: DetectedStreamEntry[]) => entries.filter((entry) => entry.detectedAt + DETECTED_STREAM_TTL_MS > now);
+function createTabDetectionState(pageUrl = ''): TabDetectionState {
+  return {
+    pageUrl,
+    entries: [],
+    manifestByOrigin: new Map<string, ManifestType>(),
+    recentByFrame: new Map<string, RecentMediaCandidate[]>(),
+    blobBackings: new Map<string, MediaCandidate>(),
+    lastMseMimeByFrame: new Map<string, string>(),
+    bufferedCandidates: [],
+    pendingInspectIds: new Set<string>(),
+  };
+}
 
+function ensureTabDetectionState(tabId: number, pageUrl = '') {
+  const existing = detectedMediaByTab.get(tabId);
+  if (existing) {
+    if (pageUrl) {
+      existing.pageUrl = pageUrl;
+    }
+    return existing;
+  }
+
+  const created = createTabDetectionState(pageUrl);
+  detectedMediaByTab.set(tabId, created);
+  return created;
+}
+
+function isProtectedMediaError(message: string) {
+  const normalized = String(message || '').toLowerCase();
+  return normalized.includes('drm') || normalized.includes('encrypted') || normalized.includes('widevine');
+}
+
+function pruneRecentMediaCandidateList(candidates: RecentMediaCandidate[]) {
+  const now = Date.now();
+  return candidates.filter((entry) => entry.detectedAt + MEDIA_BUFFER_TTL_MS > now);
+}
+
+function pruneDetectedMedia(tabId?: number) {
+  const now = Date.now();
   if (typeof tabId === 'number') {
-    const entries = pruneEntries(detectedStreamsByTab.get(tabId) ?? []);
-    if (entries.length > 0) {
-      detectedStreamsByTab.set(tabId, entries);
-    } else {
-      detectedStreamsByTab.delete(tabId);
+    const state = detectedMediaByTab.get(tabId);
+    if (!state) {
+      return;
+    }
+
+    state.entries = state.entries.filter((entry) => entry.detectedAt + DETECTED_MEDIA_TTL_MS > now);
+    state.bufferedCandidates = pruneRecentMediaCandidateList(state.bufferedCandidates);
+    for (const [frameUrl, candidates] of state.recentByFrame.entries()) {
+      const nextCandidates = pruneRecentMediaCandidateList(candidates);
+      if (nextCandidates.length > 0) {
+        state.recentByFrame.set(frameUrl, nextCandidates);
+      } else {
+        state.recentByFrame.delete(frameUrl);
+      }
+    }
+
+    for (const [blobUrl, candidate] of state.blobBackings.entries()) {
+      if (!candidate.url) {
+        state.blobBackings.delete(blobUrl);
+      }
+    }
+
+    if (state.entries.length === 0 && state.bufferedCandidates.length === 0 && state.recentByFrame.size === 0 && state.pageUrl === '') {
+      detectedMediaByTab.delete(tabId);
     }
     return;
   }
 
-  for (const currentTabId of detectedStreamsByTab.keys()) {
-    pruneDetectedStreams(currentTabId);
+  for (const currentTabId of detectedMediaByTab.keys()) {
+    pruneDetectedMedia(currentTabId);
   }
 }
 
-function getDetectedStreams(tabId: number) {
-  pruneDetectedStreams(tabId);
-  return [...(detectedStreamsByTab.get(tabId) ?? [])].sort((left, right) => right.detectedAt - left.detectedAt);
+function getDetectedMedia(tabId: number) {
+  pruneDetectedMedia(tabId);
+  const state = detectedMediaByTab.get(tabId);
+  return [...(state?.entries ?? [])].sort((left, right) => right.detectedAt - left.detectedAt);
 }
 
-function rememberDetectedStream(tabId: number, entry: Omit<DetectedStreamEntry, 'detectedAt'>) {
-  const manifestType = normalizeManifestType(entry.manifestType);
-  if (!manifestType || !entry.url) {
-    return { isNew: false };
+async function updateActionBadge(tabId: number) {
+  const count = getDetectedMedia(tabId).length;
+  await browserApi.action.setBadgeText({ tabId, text: count > 0 ? String(Math.min(count, 99)) : '' });
+  if (count > 0) {
+    await browserApi.action.setBadgeBackgroundColor({ tabId, color: '#0A0A0A' });
+  }
+}
+
+function broadcastDetectedMediaUpdate(tabId: number) {
+  const count = getDetectedMedia(tabId).length;
+  void updateActionBadge(tabId).catch(() => {
+    // Ignore badge update failures on unsupported browsers.
+  });
+  broadcastRuntimeMessage({ type: 'DETECTED_STREAMS_UPDATED', payload: { tabId, count } });
+}
+
+function rememberRecentMediaCandidate(state: TabDetectionState, frameUrl: string, candidate: MediaCandidate) {
+  const existing = state.recentByFrame.get(frameUrl) ?? [];
+  const next = [{ candidate, detectedAt: Date.now() }, ...existing];
+  state.recentByFrame.set(frameUrl, pruneRecentMediaCandidateList(next).slice(0, 16));
+}
+
+function candidateFromRecentMedia(state: TabDetectionState, frameUrl: string, blobUrl = '') {
+  if (blobUrl) {
+    const blobCandidate = state.blobBackings.get(blobUrl);
+    if (blobCandidate) {
+      return blobCandidate;
+    }
   }
 
-  const entries = getDetectedStreams(tabId);
-  const existingEntry = entries.find((candidate) => candidate.url === entry.url && candidate.manifestType === manifestType);
+  const recent = pruneRecentMediaCandidateList(state.recentByFrame.get(frameUrl) ?? []);
+  state.recentByFrame.set(frameUrl, recent);
+  return recent[0]?.candidate ?? null;
+}
+
+function mapVariantInfo(variants: unknown): VariantInfo[] {
+  if (!Array.isArray(variants)) {
+    return [];
+  }
+
+  return variants
+    .map((variant) => ({
+      id: String(variant?.id || '').trim(),
+      name: typeof variant?.name === 'string' ? variant.name : '',
+      bandwidth: Number.isFinite(Number(variant?.bandwidth)) ? Number(variant.bandwidth) : undefined,
+      resolution: typeof variant?.resolution === 'string' ? variant.resolution : '',
+      codecs: typeof variant?.codecs === 'string' ? variant.codecs : '',
+      url: typeof variant?.url === 'string' ? variant.url : '',
+    }))
+    .filter((variant) => variant.id);
+}
+
+function applyInspectResult(state: TabDetectionState, entryId: string, result: { qualities?: VariantInfo[]; selectedVariantId?: string; protected?: boolean; protectedReason?: string }) {
+  const entry = state.entries.find((candidate) => candidate.id === entryId);
+  if (!entry) {
+    return false;
+  }
+
+  if (result.qualities && result.qualities.length > 0) {
+    entry.qualities = result.qualities;
+  }
+  if (result.selectedVariantId) {
+    entry.selectedVariantId = result.selectedVariantId;
+  }
+  if (typeof result.protected === 'boolean') {
+    entry.protected = result.protected;
+  }
+  if (result.protectedReason) {
+    entry.protectedReason = result.protectedReason;
+  }
+  return true;
+}
+
+async function enrichDetectedManifest(tabId: number, entryId: string) {
+  const state = detectedMediaByTab.get(tabId);
+  if (!state || state.pendingInspectIds.has(entryId)) {
+    return;
+  }
+
+  const entry = state.entries.find((candidate) => candidate.id === entryId);
+  if (!entry?.manifestType) {
+    return;
+  }
+
+  state.pendingInspectIds.add(entryId);
+  try {
+    const requestContext = await buildForwardedRequestContext(entry.url, entry.pageUrl);
+    const response = await sendHostRequest('video.inspect', {
+      url: entry.url,
+      manifestType: entry.manifestType,
+      headers: requestContext.headers,
+      cookies: requestContext.cookies,
+    });
+    const updated = applyInspectResult(state, entryId, {
+      qualities: mapVariantInfo(response.payload?.variants),
+      selectedVariantId: typeof response.payload?.selectedVariantId === 'string' ? response.payload.selectedVariantId : '',
+    });
+    if (updated) {
+      broadcastDetectedMediaUpdate(tabId);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const updated = applyInspectResult(state, entryId, {
+      protected: isProtectedMediaError(message),
+      protectedReason: isProtectedMediaError(message) ? message : undefined,
+    });
+    if (updated && isProtectedMediaError(message)) {
+      broadcastDetectedMediaUpdate(tabId);
+    }
+  } finally {
+    state.pendingInspectIds.delete(entryId);
+  }
+}
+
+function flushBufferedCandidates(tabId: number, state: TabDetectionState, origin: string, pageUrl: string) {
+  const pending = [...state.bufferedCandidates];
+  state.bufferedCandidates = [];
+  for (const entry of pending) {
+    if (getUrlOrigin(entry.candidate.url) === origin) {
+      void recordDetectedMediaCandidate(tabId, entry.candidate, 'page', pageUrl);
+      continue;
+    }
+    state.bufferedCandidates.push(entry);
+  }
+}
+
+async function upsertDetectedMediaEntry(tabId: number, candidate: MediaCandidate, source: DetectedMediaEntry['source'], pageUrl: string) {
+  const normalizedUrl = normalizeMediaUrl(candidate.url);
+  if (!normalizedUrl) {
+    return { entry: null, isNew: false };
+  }
+
+  const state = ensureTabDetectionState(tabId, pageUrl);
+  const classification = classifyMediaCandidate({ ...candidate, url: normalizedUrl }, { manifestByOrigin: state.manifestByOrigin });
+  if (classification.kind === 'unknown') {
+    return { entry: null, isNew: false };
+  }
+
+  if (classification.kind === 'segment_hls' || classification.kind === 'segment_dash') {
+    state.bufferedCandidates = pruneRecentMediaCandidateList([
+      { candidate: { ...candidate, url: normalizedUrl }, detectedAt: Date.now() },
+      ...state.bufferedCandidates,
+    ]);
+    return { entry: null, isNew: false };
+  }
+
+  const entryId = mediaIdForCandidate(classification.kind, normalizedUrl);
+  const existingEntry = state.entries.find((entry) => entry.id === entryId);
+  const sizeHint = Number(candidate.sizeHint);
   if (existingEntry) {
     existingEntry.detectedAt = Date.now();
-    existingEntry.source = entry.source;
-  } else {
-    entries.unshift({ ...entry, manifestType, detectedAt: Date.now() });
+    existingEntry.source = source;
+    existingEntry.pageUrl = pageUrl || existingEntry.pageUrl;
+    if (candidate.posterUrl) {
+      existingEntry.posterUrl = candidate.posterUrl;
+    }
+    if (Number.isFinite(sizeHint) && sizeHint > 0) {
+      existingEntry.sizeHint = sizeHint;
+    }
+    broadcastDetectedMediaUpdate(tabId);
+    return { entry: existingEntry, isNew: false };
   }
-  detectedStreamsByTab.set(tabId, entries.slice(0, 24));
-  broadcastRuntimeMessage({ type: 'DETECTED_STREAMS_UPDATED', payload: { tabId, count: entries.length } });
-  return { isNew: !existingEntry };
+
+  const entry: DetectedMediaEntry = {
+    id: entryId,
+    url: normalizedUrl,
+    kind: classification.kind,
+    label: classification.label,
+    pageUrl,
+    detectedAt: Date.now(),
+    source,
+    sizeHint: Number.isFinite(sizeHint) && sizeHint > 0 ? sizeHint : undefined,
+    manifestType: classification.manifestType,
+    posterUrl: candidate.posterUrl || undefined,
+  };
+  state.entries.unshift(entry);
+  state.entries = state.entries.slice(0, 24);
+  if (classification.manifestType) {
+    const origin = getUrlOrigin(normalizedUrl);
+    if (origin) {
+      state.manifestByOrigin.set(origin, classification.manifestType);
+      flushBufferedCandidates(tabId, state, origin, pageUrl);
+    }
+  }
+  broadcastDetectedMediaUpdate(tabId);
+  return { entry, isNew: true };
+}
+
+async function recordDetectedMediaCandidate(tabId: number, candidate: MediaCandidate, source: DetectedMediaEntry['source'], pageUrl: string) {
+  const normalizedUrl = normalizeMediaUrl(candidate.url);
+  if (!normalizedUrl) {
+    return;
+  }
+
+  const state = ensureTabDetectionState(tabId, pageUrl);
+  const frameUrl = String(candidate.frameUrl || pageUrl || '');
+  const candidateWithHints = {
+    ...candidate,
+    url: normalizedUrl,
+    mimeFromMSE: candidate.mimeFromMSE || state.lastMseMimeByFrame.get(frameUrl) || '',
+  };
+  rememberRecentMediaCandidate(state, frameUrl, candidateWithHints);
+
+  const { entry, isNew } = await upsertDetectedMediaEntry(tabId, candidateWithHints, source, pageUrl);
+  if (!entry) {
+    return;
+  }
+
+  if (entry.manifestType && (!entry.qualities || entry.qualities.length === 0) && !entry.protected) {
+    void enrichDetectedManifest(tabId, entry.id);
+  }
+
+  if (!isNew || !entry.manifestType) {
+    return;
+  }
+
+  try {
+    const settings = await getInterceptionSettings();
+    const schedule = buildInterceptionSchedule(settings);
+    if (settings.autoShowDetectedStreams) {
+      await showDetectedStreamOverlay(tabId, entry.url, entry.manifestType, schedule);
+    }
+  } catch (error) {
+    console.warn('Failed to process detected media:', error);
+  }
+}
+
+async function handlePageHookPayload(tabId: number, payload: PageHookPayload | ScanPayload, pageUrl: string) {
+  const state = ensureTabDetectionState(tabId, pageUrl);
+  const frameUrl = String(payload.frameUrl || pageUrl || '');
+
+  if (payload.event === 'mse') {
+    if (payload.mimeFromMSE) {
+      state.lastMseMimeByFrame.set(frameUrl, String(payload.mimeFromMSE));
+    }
+    return;
+  }
+
+  if (payload.event === 'blob_created') {
+    const recentCandidate = candidateFromRecentMedia(state, frameUrl);
+    if (recentCandidate && payload.url) {
+      state.blobBackings.set(String(payload.url), {
+        ...recentCandidate,
+        mimeFromMSE: state.lastMseMimeByFrame.get(frameUrl) || recentCandidate.mimeFromMSE,
+      });
+    }
+    return;
+  }
+
+  if (payload.event === 'media_src' && isBlobUrl(payload.url)) {
+    const backingCandidate = candidateFromRecentMedia(state, frameUrl, String(payload.url || payload.blobUrl || ''));
+    if (!backingCandidate) {
+      return;
+    }
+
+    await recordDetectedMediaCandidate(tabId, {
+      ...backingCandidate,
+      posterUrl: payload.posterUrl || backingCandidate.posterUrl,
+      frameUrl,
+      mimeFromMSE: state.lastMseMimeByFrame.get(frameUrl) || backingCandidate.mimeFromMSE,
+    }, 'page', pageUrl);
+    return;
+  }
+
+  if (payload.url) {
+    await recordDetectedMediaCandidate(tabId, {
+      ...payload,
+      mimeFromMSE: payload.mimeFromMSE || state.lastMseMimeByFrame.get(frameUrl) || '',
+      frameUrl,
+    }, payload.event === 'scan' ? 'scan' : 'page', pageUrl);
+  }
 }
 
 async function getActiveTab() {
@@ -229,7 +553,7 @@ async function ensureContentScript(tabId: number) {
 
     try {
       await browserApi.scripting.executeScript({
-        target: { tabId },
+        target: { tabId, allFrames: true },
         files,
       });
       await browserApi.tabs.sendMessage(tabId, { type: 'PING_TUYULDM_CONTENT' });
@@ -250,6 +574,15 @@ async function sendMessageToTab(tabId: number, message: Record<string, unknown>)
   return browserApi.tabs.sendMessage(tabId, message);
 }
 
+async function sendMessageToFrame(tabId: number, frameId: number, message: Record<string, unknown>) {
+  const ready = await ensureContentScript(tabId);
+  if (!ready) {
+    return null;
+  }
+
+  return browserApi.tabs.sendMessage(tabId, message, { frameId });
+}
+
 async function showDetectedStreamOverlay(tabId: number, url: string, manifestType: string, schedule?: OverlayDownloadSchedule) {
   try {
     await sendMessageToTab(tabId, {
@@ -265,40 +598,20 @@ async function showDetectedStreamOverlay(tabId: number, url: string, manifestTyp
 
 async function scanTabForVideos(tabId: number) {
   try {
-    const response = await sendMessageToTab(tabId, { type: 'SCAN_PAGE_VIDEOS' });
-    return Array.isArray((response as any)?.streams) ? (response as any).streams : [];
+    const frames = await browserApi.webNavigation.getAllFrames({ tabId }).catch(() => [{ frameId: 0 }]);
+    const results = await Promise.all((frames || [{ frameId: 0 }]).map((frame: any) =>
+      sendMessageToFrame(tabId, Number(frame?.frameId ?? 0), { type: 'SCAN_PAGE' }).catch(() => null)));
+    return results.flatMap((response: any) => Array.isArray(response?.candidates) ? response.candidates : []);
   } catch (error) {
     console.warn('Failed to scan tab for videos:', error);
     return [];
   }
 }
 
-async function recordDetectedStream(tabId: number, url: string, manifestType: string, source: DetectedStreamEntry['source']) {
-  const normalizedType = normalizeManifestType(manifestType);
-  if (!normalizedType) {
-    return;
-  }
-
-  const { isNew } = rememberDetectedStream(tabId, { url, manifestType: normalizedType, source });
-  if (!isNew) {
-    return;
-  }
-
-  try {
-    const settings = await getInterceptionSettings();
-    const schedule = buildInterceptionSchedule(settings);
-    if (settings.autoShowDetectedStreams) {
-      await showDetectedStreamOverlay(tabId, url, normalizedType, schedule);
-    }
-  } catch (error) {
-    console.warn('Failed to process detected stream:', error);
-  }
-}
-
-async function refreshDetectedStreamsFromPage(tabId: number) {
+async function refreshDetectedMediaFromPage(tabId: number, pageUrl = '') {
   const results = await scanTabForVideos(tabId);
-  await Promise.all(results.map((entry: any) => recordDetectedStream(tabId, String(entry?.url || ''), String(entry?.manifestType || ''), 'page')));
-  return getDetectedStreams(tabId);
+  await Promise.all(results.map((entry: any) => handlePageHookPayload(tabId, entry, pageUrl)));
+  return getDetectedMedia(tabId);
 }
 
 function normalizeList(value: unknown) {
@@ -672,16 +985,6 @@ function connectToHost() {
   }
 }
 
-function postToHost(message: Record<string, unknown>) {
-  if (!port && !connectToHost()) {
-    console.error('Native host not connected.');
-    return false;
-  }
-
-  port!.postMessage(message);
-  return true;
-}
-
 function sendHostRequest(method: string, params: Record<string, unknown> = {}) {
   if (!port && !connectToHost()) {
     return Promise.reject(new Error(hostStatus.lastError || 'Native host not connected'));
@@ -736,10 +1039,57 @@ async function interceptDownload(item: any) {
   }
 }
 
+async function startDetectedMediaDownload(tabId: number, entryId: string, selectedVariantId = '') {
+  const state = detectedMediaByTab.get(tabId);
+  const entry = state?.entries.find((candidate) => candidate.id === entryId);
+  if (!entry) {
+    throw new Error('Detected media entry no longer exists');
+  }
+  if (entry.protected) {
+    throw new Error(entry.protectedReason || 'Encrypted (DRM) media cannot be downloaded');
+  }
+
+  const requestContext = await buildForwardedRequestContext(entry.url, entry.pageUrl);
+  const settings = await getInterceptionSettings();
+  if (entry.kind === 'progressive_mp4') {
+    const fileExtension = getFileExtension(entry.url) || (entry.label.toLowerCase().includes('webm') ? 'webm' : 'mp4');
+    await sendHostRequest('download.add', {
+      url: entry.url,
+      filename: `Media_${Date.now()}.${fileExtension}`,
+      schedule: buildInterceptionSchedule(settings),
+      headers: requestContext.headers,
+      cookies: requestContext.cookies,
+    });
+    return;
+  }
+
+  if (!entry.manifestType) {
+    throw new Error('Detected media is not downloadable yet');
+  }
+
+  await sendHostRequest('download.video', {
+    url: entry.url,
+    filename: `Video_${Date.now()}.mp4`,
+    manifestType: entry.manifestType,
+    selectedVariantId: selectedVariantId || entry.selectedVariantId,
+    schedule: buildInterceptionSchedule(settings),
+    headers: requestContext.headers,
+    cookies: requestContext.cookies,
+  });
+}
+
 connectToHost();
 
 browserApi.tabs.onRemoved.addListener((tabId: number) => {
-  detectedStreamsByTab.delete(tabId);
+  detectedMediaByTab.delete(tabId);
+});
+
+browserApi.tabs.onActivated?.addListener((details: any) => {
+  if (details?.tabId != null) {
+    void updateActionBadge(details.tabId).catch(() => {
+      // Ignore badge update failures.
+    });
+  }
 });
 
 browserApi.webRequest.onSendHeaders.addListener(
@@ -752,63 +1102,67 @@ browserApi.webRequest.onSendHeaders.addListener(
 
 browserApi.webRequest.onHeadersReceived.addListener(
   (details: any) => {
-    const url = details.url;
-    let isManifest = false;
-    let manifestType = '';
+    if (details.tabId < 0) {
+      return;
+    }
 
-    if (details.responseHeaders) {
-      for (const header of details.responseHeaders) {
-        if (header.name.toLowerCase() !== 'content-type' || typeof header.value !== 'string') {
-          continue;
-        }
-
-        const value = header.value.toLowerCase();
-        if (value.includes('application/vnd.apple.mpegurl') || value.includes('application/x-mpegurl')) {
-          isManifest = true;
-          manifestType = 'HLS';
-          break;
-        }
-        if (value.includes('application/dash+xml')) {
-          isManifest = true;
-          manifestType = 'DASH';
-          break;
-        }
+    const responseHeaders: Record<string, string> = {};
+    for (const header of details.responseHeaders ?? []) {
+      if (typeof header?.name === 'string' && typeof header?.value === 'string') {
+        responseHeaders[header.name] = header.value;
       }
     }
 
-    if (!isManifest && (url.includes('.m3u8') || url.includes('.mpd'))) {
-      isManifest = true;
-      manifestType = url.includes('.m3u8') ? 'HLS' : 'DASH';
-    }
-
-    if (isManifest && details.tabId >= 0) {
-      void recordDetectedStream(details.tabId, url, manifestType, 'network');
-    }
+    void recordDetectedMediaCandidate(details.tabId, {
+      url: details.url,
+      frameUrl: typeof details.documentUrl === 'string' ? details.documentUrl : '',
+      contentType: responseHeaders['Content-Type'] || responseHeaders['content-type'] || '',
+      responseHeaders,
+      requestHeaders: getCapturedRequestHeaders(details.url),
+    }, 'network', typeof details.documentUrl === 'string' ? details.documentUrl : '');
   },
   { urls: ['<all_urls>'], types: ['xmlhttprequest', 'media', 'other', 'sub_frame', 'object', 'main_frame'] },
   ['responseHeaders'],
 );
+
+browserApi.webNavigation.onCommitted.addListener((details: any) => {
+  if (details.frameId !== 0 || details.tabId < 0) {
+    return;
+  }
+
+  detectedMediaByTab.set(details.tabId, createTabDetectionState(typeof details.url === 'string' ? details.url : ''));
+  void updateActionBadge(details.tabId).catch(() => {
+    // Ignore badge update failures.
+  });
+});
 
 browserApi.webNavigation.onCompleted.addListener((details: any) => {
   if (details.frameId !== 0 || details.tabId < 0) {
     return;
   }
 
-  void getActiveTab()
-    .then((tab) => {
-      if (!tab?.id || tab.id !== details.tabId) {
-        return;
-      }
-      return refreshDetectedStreamsFromPage(details.tabId);
-    })
+  void refreshDetectedMediaFromPage(details.tabId, typeof details.url === 'string' ? details.url : '')
     .catch((error: unknown) => {
-      console.warn('Active-tab manifest scan failed:', error);
+      console.warn('Active-tab media scan failed:', error);
     });
 });
 
-browserApi.runtime.onMessage.addListener(((message: any, _sender: any, sendResponse: (response?: any) => void) => {
+browserApi.runtime.onMessage.addListener(((message: any, sender: any, sendResponse: (response?: any) => void) => {
+  if (message.type === 'PAGE_HOOK_EVENT') {
+    const tabId = sender?.tab?.id;
+    if (typeof tabId !== 'number') {
+      return false;
+    }
+
+    const pageUrl = typeof sender?.tab?.url === 'string' ? sender.tab.url : '';
+    void handlePageHookPayload(tabId, message.payload ?? {}, pageUrl).catch((error) => {
+      console.warn('Failed to process page hook payload:', error);
+    });
+    return false;
+  }
+
   if (message.type === 'INSPECT_VIDEO_MANIFEST') {
-    buildForwardedRequestContext(message.url)
+    buildForwardedRequestContext(message.url, String(message.pageUrl || ''))
       .then((requestContext) => sendHostRequest('video.inspect', {
         url: message.url,
         manifestType: message.manifestType,
@@ -886,18 +1240,18 @@ browserApi.runtime.onMessage.addListener(((message: any, _sender: any, sendRespo
 
   if (message.type === 'GET_DETECTED_STREAMS') {
     getActiveTab()
-      .then((tab) => sendResponse({ streams: tab?.id != null ? getDetectedStreams(tab.id) : [] }))
+      .then((tab) => sendResponse({ streams: tab?.id != null ? getDetectedMedia(tab.id) : [] }))
       .catch((error) => sendResponse({ error: String(error), streams: [] }));
     return true;
   }
 
-  if (message.type === 'SCAN_PAGE_VIDEOS') {
+  if (message.type === 'SCAN_PAGE' || message.type === 'SCAN_PAGE_VIDEOS') {
     getActiveTab()
       .then(async (tab) => {
         if (!tab?.id) {
           return { streams: [] };
         }
-        const streams = await refreshDetectedStreamsFromPage(tab.id);
+        const streams = await refreshDetectedMediaFromPage(tab.id, typeof tab.url === 'string' ? tab.url : '');
         return { streams };
       })
       .then((result) => sendResponse(result))
@@ -1013,9 +1367,30 @@ browserApi.runtime.onMessage.addListener(((message: any, _sender: any, sendRespo
     return false;
   }
 
+  if (message.type === 'START_DETECTED_MEDIA_DOWNLOAD') {
+    getActiveTab()
+      .then(async (tab) => {
+        if (!tab?.id) {
+          throw new Error('Active tab unavailable');
+        }
+        await startDetectedMediaDownload(tab.id, String(message.id || ''), String(message.selectedVariantId || ''));
+        return { ok: true };
+      })
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ error: String(error) }));
+    return true;
+  }
+
   if (message.type === 'START_DOWNLOAD') {
     const filename = message.url.substring(message.url.lastIndexOf('/') + 1) || `Download_${Date.now()}`;
     buildForwardedRequestContext(message.url)
+      .catch((error) => {
+        console.warn('Failed to collect request context for manual download:', error);
+        return {
+          headers: {},
+          cookies: [],
+        };
+      })
       .then((requestContext) => sendHostRequest('download.add', {
         url: message.url,
         filename,
@@ -1024,15 +1399,6 @@ browserApi.runtime.onMessage.addListener(((message: any, _sender: any, sendRespo
         headers: requestContext.headers,
         cookies: requestContext.cookies,
       }))
-      .catch((error) => {
-        console.warn('Failed to collect request context for manual download:', error);
-        return sendHostRequest('download.add', {
-          url: message.url,
-          filename,
-          segments: message.segments || 8,
-          schedule: message.schedule,
-        });
-      })
       .catch((error) => console.error('Failed to start manual download:', error));
     return false;
   }
