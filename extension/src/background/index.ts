@@ -614,6 +614,27 @@ browserApi.runtime.onMessage.addListener(((message: any, _sender: any, sendRespo
     return true;
   }
 
+  if (message.type === 'OPEN_DOWNLOAD_FILE') {
+    sendHostRequest('host.openFile', { id: String(message.id) })
+      .then((response) => sendResponse({ path: response.payload?.path, status: hostStatus }))
+      .catch((error) => sendResponse({ error: String(error), status: hostStatus }));
+    return true;
+  }
+
+  if (message.type === 'REVEAL_DOWNLOAD_IN_FOLDER') {
+    sendHostRequest('host.revealInFolder', { id: String(message.id) })
+      .then((response) => sendResponse({ path: response.payload?.path, status: hostStatus }))
+      .catch((error) => sendResponse({ error: String(error), status: hostStatus }));
+    return true;
+  }
+
+  if (message.type === 'PICK_DOWNLOAD_DIRECTORY') {
+    sendHostRequest('host.pickDirectory', { initial: String(message.initial || '') })
+      .then((response) => sendResponse({ path: response.payload?.path || '', status: hostStatus }))
+      .catch((error) => sendResponse({ error: String(error), status: hostStatus }));
+    return true;
+  }
+
   if (message.type === 'START_VIDEO_DOWNLOAD') {
     Promise.all([buildForwardedRequestContext(message.url), getInterceptionSettings()])
       .then(([requestContext, settings]) => sendHostRequest('download.video', {

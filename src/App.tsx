@@ -9,6 +9,8 @@ import {
   CheckCircle2,
   Copy,
   Download,
+  ExternalLink,
+  FolderOpen,
   Github,
   Pause,
   Play,
@@ -711,10 +713,10 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     await refreshPreviewData();
   };
 
-  const commitDownloadDir = async () => {
+  const commitDownloadDir = async (nextDownloadDir?: string) => {
     const nextSettings = {
       ...hostSettings,
-      downloadDir: downloadDirInput.trim(),
+      downloadDir: (nextDownloadDir ?? downloadDirInput).trim(),
     };
 
     if (isExtensionRuntimeAvailable()) {
@@ -739,8 +741,51 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     applyHostSettings(nextSettings);
   };
 
-  const openDownloadDirPickerFallback = () => {
-    setDownloadDirError('Directory picker not wired yet. Type absolute path manually.');
+  const pickDownloadDirectory = async () => {
+    if (!isExtensionRuntimeAvailable()) {
+      setDownloadDirError('Directory picker requires native host access. Type absolute path manually.');
+      return;
+    }
+
+    const response = await sendExtensionMessage<{ path?: string; error?: string }>({
+      type: 'PICK_DOWNLOAD_DIRECTORY',
+      initial: downloadDirInput.trim() || hostSettings.downloadDir,
+    });
+
+    if (response?.error) {
+      setDownloadDirError(response.error);
+      return;
+    }
+    if (!response?.path) {
+      return;
+    }
+
+    setDownloadDirInput(response.path);
+    await commitDownloadDir(response.path);
+  };
+
+  const openDownloadFile = async (id: number | string) => {
+    if (isExtensionRuntimeAvailable()) {
+      const response = await sendExtensionMessage<{ error?: string }>({ type: 'OPEN_DOWNLOAD_FILE', id });
+      if (response?.error) {
+        console.error('Failed to open download file:', response.error);
+      }
+      return;
+    }
+
+    await fetch(`/api/downloads/${id}/open`, { method: 'POST' });
+  };
+
+  const revealDownloadInFolder = async (id: number | string) => {
+    if (isExtensionRuntimeAvailable()) {
+      const response = await sendExtensionMessage<{ error?: string }>({ type: 'REVEAL_DOWNLOAD_IN_FOLDER', id });
+      if (response?.error) {
+        console.error('Failed to reveal download file:', response.error);
+      }
+      return;
+    }
+
+    await fetch(`/api/downloads/${id}/reveal`, { method: 'POST' });
   };
 
   const copyPathToClipboard = async (value: string | undefined) => {
@@ -847,7 +892,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
               <label className="text-[13px] font-medium tracking-wide text-white/90">Download Directory</label>
               <button
                 type="button"
-                onClick={openDownloadDirPickerFallback}
+                onClick={() => void pickDownloadDirectory()}
                 className="rounded-lg border border-white/10 px-3 py-1.5 text-[11px] uppercase tracking-wider text-white/60 transition-colors hover:border-white/20 hover:text-white/85"
               >
                 Browse...
@@ -1289,7 +1334,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
         </header>
 
         <div className="flex-1 overflow-auto relative">
-          <div className="grid grid-cols-[40px_1fr_120px_180px_120px_100px] gap-4 px-6 py-3 sticky top-0 border-b border-white/5 bg-[#0A0A0A]/90 backdrop-blur-xl z-10">
+          <div className="grid grid-cols-[40px_1fr_120px_180px_120px_160px] gap-4 px-6 py-3 sticky top-0 border-b border-white/5 bg-[#0A0A0A]/90 backdrop-blur-xl z-10">
             <div className="col-header">ID</div>
             <div className="col-header">File Name</div>
             <div className="col-header">Size</div>
@@ -1307,7 +1352,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, scale: 0.95 }}
-                  className="data-row grid grid-cols-[40px_1fr_120px_180px_120px_100px] gap-4 px-3 py-3 items-center group"
+                  className="data-row grid grid-cols-[40px_1fr_120px_180px_120px_160px] gap-4 px-3 py-3 items-center group"
                 >
                   <div className="data-value opacity-40">{typeof download.id === 'number' ? download.id.toString().padStart(2, '0') : download.id.substring(0, 4)}</div>
                   <div className="flex flex-col min-w-0 pr-4">
@@ -1355,6 +1400,24 @@ export default function App({ surface = 'dashboard' }: AppProps) {
                   </div>
                   <div className="data-value">{download.speed}</div>
                   <div className="relative flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void revealDownloadInFolder(download.id)}
+                      disabled={!download.output_path}
+                      className="p-1.5 text-white/40 hover:text-white hover:bg-white/10 rounded-md transition-all disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent"
+                      title="Reveal in folder"
+                    >
+                      <FolderOpen className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void openDownloadFile(download.id)}
+                      disabled={download.status !== 'finished'}
+                      className="p-1.5 text-white/40 hover:text-white hover:bg-white/10 rounded-md transition-all disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent"
+                      title="Open file"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    </button>
                     <button
                       onClick={() => void togglePlayPause(download.id, download.status)}
                       className="p-1.5 text-white/40 hover:text-white hover:bg-white/10 rounded-md transition-all"

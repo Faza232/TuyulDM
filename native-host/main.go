@@ -301,13 +301,88 @@ func main() {
 				resp.Message = err.Error()
 				break
 			}
-			if err := openPathInDefaultApp(logPath); err != nil {
+			if err := openFilePath(logPath); err != nil {
 				slog.Error("open logs failed", "error", err, "path", logPath)
 				resp.Status = "error"
 				resp.Message = err.Error()
 			} else {
 				resp.Status = "ok"
 				resp.Payload = map[string]string{"path": logPath}
+			}
+		case "host.openFile":
+			var params struct {
+				ID string `json:"id"`
+			}
+			if err := decodeParams(req, &params); err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				break
+			}
+			state, err := storage.GetDownload(params.ID)
+			if err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				break
+			}
+			outputPath, err := resolveDownloadOpenPath(state, engine.HostSettings())
+			if err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				break
+			}
+			if err := openFilePath(outputPath); err != nil {
+				slog.Error("open download file failed", "error", err, "download_id", state.ID, "path", outputPath)
+				resp.Status = "error"
+				resp.Message = err.Error()
+			} else {
+				resp.Status = "ok"
+				resp.Payload = map[string]string{"path": outputPath}
+			}
+		case "host.revealInFolder":
+			var params struct {
+				ID string `json:"id"`
+			}
+			if err := decodeParams(req, &params); err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				break
+			}
+			state, err := storage.GetDownload(params.ID)
+			if err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				break
+			}
+			outputPath, err := resolveDownloadRevealPath(state, engine.HostSettings())
+			if err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				break
+			}
+			if err := revealFileInFolder(outputPath); err != nil {
+				slog.Error("reveal download file failed", "error", err, "download_id", state.ID, "path", outputPath)
+				resp.Status = "error"
+				resp.Message = err.Error()
+			} else {
+				resp.Status = "ok"
+				resp.Payload = map[string]string{"path": outputPath}
+			}
+		case "host.pickDirectory":
+			var params struct {
+				Initial string `json:"initial,omitempty"`
+			}
+			if err := decodeParams(req, &params); err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				break
+			}
+			selectedPath, err := pickDirectory(params.Initial)
+			if err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+			} else {
+				resp.Status = "ok"
+				resp.Payload = map[string]string{"path": selectedPath}
 			}
 		case "download.getProgress":
 			var params struct {

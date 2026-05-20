@@ -37,9 +37,9 @@ async function startServer() {
 
   // Mock Native Host API for the preview
   const activeDownloads = [
-    { id: 1, name: "ubuntu-24.04-desktop-amd64.iso", size: "4.7 GB", progress: 45, speed: "12.4 MB/s", status: "downloading", type: "file" },
-    { id: 2, name: "TuyulDM_Source.zip", size: "120 MB", progress: 100, speed: "0 B/s", status: "finished", type: "file" },
-    { id: 3, name: "Presentation_Video_HLS.mp4", size: "890 MB", progress: 12, speed: "2.1 MB/s", status: "downloading", type: "video" },
+    { id: 1, name: "ubuntu-24.04-desktop-amd64.iso", output_path: "/home/faza/Downloads/ubuntu-24.04-desktop-amd64.iso", size: "4.7 GB", progress: 45, speed: "12.4 MB/s", status: "downloading", type: "file" },
+    { id: 2, name: "TuyulDM_Source.zip", output_path: "/home/faza/Downloads/TuyulDM_Source.zip", size: "120 MB", progress: 100, speed: "0 B/s", status: "finished", type: "file" },
+    { id: 3, name: "Presentation_Video_HLS.mp4", output_path: "/home/faza/Downloads/Presentation_Video_HLS.mp4", size: "890 MB", progress: 12, speed: "2.1 MB/s", status: "downloading", type: "video" },
   ];
 
   app.get("/api/host-status", (_req, res) => {
@@ -88,6 +88,8 @@ async function startServer() {
       } else if (action === "resume") {
         dl.status = "downloading";
         dl.speed = "10.5 MB/s"; // mock speed
+      } else if (action === "open" || action === "reveal") {
+        // Preview server does not control OS file managers. Keep API shape only.
       }
     }
     res.json(dl || {});
