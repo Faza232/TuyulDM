@@ -1,4 +1,4 @@
-after I try it myself there is many thing that should be fixed, create BUILD_PLAN.md to fix this
+after I try it myself there is many thing that should be fixed, create BUILD_PLAN_2.md to fix this
 add logging for error download.
 the finished download cannot be located anywhere.
 video grabber are not clickable and cannot detect video in browser.
