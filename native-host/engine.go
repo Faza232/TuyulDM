@@ -207,7 +207,10 @@ func (e *Engine) HostSettings() HostSettings {
 }
 
 func (e *Engine) UpdateHostSettings(settings HostSettings) error {
-	normalizedSettings := normalizeHostSettings(settings)
+	normalizedSettings, err := validateHostSettingsUpdate(settings)
+	if err != nil {
+		return err
+	}
 	if err := e.storage.SaveHostSettings(normalizedSettings); err != nil {
 		return err
 	}
@@ -251,7 +254,7 @@ func (e *Engine) Add(req DownloadRequest) (*DownloadState, error) {
 		return nil, err
 	}
 
-	filename, outputPath, err := resolveDownloadTarget(metadata.FinalURL, req.Filename)
+	filename, outputPath, err := e.resolveDownloadTarget(metadata.FinalURL, req.Filename)
 	if err != nil {
 		return nil, err
 	}
@@ -932,15 +935,18 @@ func buildSegments(totalSize int64, requestedSegments int, canSegment bool) []Se
 	return segments
 }
 
-func resolveDownloadTarget(downloadURL string, requestedName string) (string, string, error) {
+func (e *Engine) resolveDownloadTarget(downloadURL string, requestedName string) (string, string, error) {
+	downloadsDir, err := ResolveDownloadDir(e.HostSettings())
+	if err != nil {
+		return "", "", err
+	}
+	return resolveDownloadTarget(downloadURL, requestedName, downloadsDir)
+}
+
+func resolveDownloadTarget(downloadURL string, requestedName string, downloadsDir string) (string, string, error) {
 	filename := strings.TrimSpace(filepath.Base(requestedName))
 	if filename == "" || filename == "." || filename == string(filepath.Separator) {
 		filename = filenameFromURL(downloadURL)
-	}
-
-	downloadsDir, err := DownloadsDir()
-	if err != nil {
-		return "", "", err
 	}
 
 	return filename, filepath.Join(downloadsDir, filename), nil

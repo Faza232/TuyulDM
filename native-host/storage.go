@@ -197,7 +197,19 @@ func (s *Storage) GetHostSettings() (HostSettings, error) {
 		}
 		return json.Unmarshal(value, &settings)
 	})
-	return normalizeHostSettings(settings), err
+	if err != nil {
+		return HostSettings{}, err
+	}
+	hydrated, changed, err := hydrateHostSettings(settings)
+	if err != nil {
+		return HostSettings{}, err
+	}
+	if changed {
+		if saveErr := s.SaveHostSettings(hydrated); saveErr != nil {
+			return HostSettings{}, saveErr
+		}
+	}
+	return hydrated, nil
 }
 
 func (s *Storage) SaveHostSettings(settings HostSettings) error {

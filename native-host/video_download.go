@@ -48,7 +48,7 @@ func (e *Engine) AddVideo(req VideoDownloadRequest) (*DownloadState, error) {
 		return nil, err
 	}
 
-	filename, outputPath, err := resolveDownloadTarget(req.URL, ensureVideoFilename(req.Filename))
+	filename, outputPath, err := e.resolveDownloadTarget(req.URL, ensureVideoFilename(req.Filename))
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +127,7 @@ func totalKnownSegmentBytes(segments []Segment) (int64, bool) {
 }
 
 func (e *Engine) runVideoDownload(a *ActiveDownload) {
-	segmentDir, err := videoSegmentDir(a.State)
+	segmentDir, err := e.videoSegmentDir(a.State)
 	if err != nil {
 		e.failDownload(a, err)
 		return
@@ -485,8 +485,8 @@ func prepareVideoSegmentFile(a *ActiveDownload, idx int, path string) (*os.File,
 	return file, resumeOffset, nil
 }
 
-func videoSegmentDir(state *DownloadState) (string, error) {
-	downloadsDir, err := DownloadsDir()
+func (e *Engine) videoSegmentDir(state *DownloadState) (string, error) {
+	downloadsDir, err := ResolveDownloadDir(e.HostSettings())
 	if err != nil {
 		return "", err
 	}

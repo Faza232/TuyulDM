@@ -7,6 +7,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import {
   Activity,
   CheckCircle2,
+  Copy,
   Download,
   Github,
   Pause,
@@ -30,6 +31,7 @@ interface DownloadItem {
   id: number | string;
   name?: string;
   filename?: string;
+  output_path?: string;
   size?: string;
   total_size?: number;
   progress: number;
@@ -69,6 +71,7 @@ interface HostSettings {
   maxConcurrentDownloads: number;
   globalThrottleBytesPerSecond: number;
   perDownloadThrottleBytesPerSecond: number;
+  downloadDir: string;
   logLevel: string;
 }
 
@@ -106,6 +109,7 @@ const DEFAULT_HOST_SETTINGS: HostSettings = {
   maxConcurrentDownloads: 3,
   globalThrottleBytesPerSecond: 0,
   perDownloadThrottleBytesPerSecond: 0,
+  downloadDir: '',
   logLevel: 'info',
 };
 
@@ -252,6 +256,7 @@ function normalizeHostSettings(settings: Partial<HostSettings> | undefined): Hos
     perDownloadThrottleBytesPerSecond: Number.isFinite(Number(settings?.perDownloadThrottleBytesPerSecond))
       ? Math.max(0, Number(settings?.perDownloadThrottleBytesPerSecond))
       : DEFAULT_HOST_SETTINGS.perDownloadThrottleBytesPerSecond,
+    downloadDir: typeof settings?.downloadDir === 'string' ? settings.downloadDir.trim() : DEFAULT_HOST_SETTINGS.downloadDir,
     logLevel: normalizeLogLevel(settings?.logLevel),
   };
 }
@@ -325,6 +330,19 @@ function formatAttemptTimestamp(value: string | undefined) {
   return timestamp.toLocaleString();
 }
 
+function getDownloadParentDirectory(outputPath: string | undefined) {
+  if (!outputPath) {
+    return '';
+  }
+
+  const normalized = outputPath.replace(/[\\/]+$/, '');
+  const separatorIndex = Math.max(normalized.lastIndexOf('/'), normalized.lastIndexOf('\\'));
+  if (separatorIndex <= 0) {
+    return normalized;
+  }
+  return normalized.slice(0, separatorIndex);
+}
+
 export default function App({ surface = 'dashboard' }: AppProps) {
   const isOptionsSurface = surface === 'options';
   const [downloads, setDownloads] = useState<DownloadItem[]>([]);
@@ -343,6 +361,8 @@ export default function App({ surface = 'dashboard' }: AppProps) {
   const [hostStatus, setHostStatus] = useState<HostStatus>(DEFAULT_HOST_STATUS);
   const [hostStats, setHostStats] = useState<HostStats>(DEFAULT_HOST_STATS);
   const [hostSettings, setHostSettings] = useState<HostSettings>(DEFAULT_HOST_SETTINGS);
+  const [downloadDirInput, setDownloadDirInput] = useState(DEFAULT_HOST_SETTINGS.downloadDir);
+  const [downloadDirError, setDownloadDirError] = useState<string | null>(null);
   const [scheduleEnabled, setScheduleEnabled] = useState(false);
   const [scheduleStartHour, setScheduleStartHour] = useState(2);
   const [scheduleEndHour, setScheduleEndHour] = useState(6);
@@ -384,6 +404,8 @@ export default function App({ surface = 'dashboard' }: AppProps) {
   const applyHostSettings = (settings: Partial<HostSettings>) => {
     const normalized = normalizeHostSettings(settings);
     setHostSettings(normalized);
+    setDownloadDirInput(normalized.downloadDir);
+    setDownloadDirError(null);
     return normalized;
   };
 
@@ -661,6 +683,63 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     }
   };
 
+  const commitDownloadDir = async () => {
+    const nextSettings = {
+      ...hostSettings,
+      downloadDir: downloadDirInput.trim(),
+    };
+
+    if (isExtensionRuntimeAvailable()) {
+      const response = await sendExtensionMessage<{ settings?: HostSettings; error?: string }>({
+        type: 'UPDATE_HOST_SETTINGS',
+        settings: nextSettings,
+      });
+
+      if (response?.error) {
+        setDownloadDirError(response.error);
+        setDownloadDirInput(hostSettings.downloadDir);
+        return;
+      }
+
+      if (response?.settings) {
+        applyHostSettings(response.settings);
+        return;
+      }
+    }
+
+    localStorage.setItem(HOST_SETTINGS_STORAGE_KEY, JSON.stringify(normalizeHostSettings(nextSettings)));
+    applyHostSettings(nextSettings);
+  };
+
+  const openDownloadDirPickerFallback = () => {
+    setDownloadDirError('Directory picker not wired yet. Type absolute path manually.');
+  };
+
+  const copyPathToClipboard = async (value: string | undefined) => {
+    if (!value) {
+      return;
+    }
+
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+        return;
+      }
+
+      const textarea = document.createElement('textarea');
+      textarea.value = value;
+      textarea.setAttribute('readonly', 'true');
+      textarea.style.position = 'absolute';
+      textarea.style.left = '-9999px';
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+    } catch (error) {
+      console.error('Failed to copy output path:', error);
+    }
+  };
+
   const filteredDownloads = downloads.filter((download) => {
     if (activeTab === 'grabber') {
       return download.type === 'video';
@@ -735,6 +814,41 @@ export default function App({ surface = 'dashboard' }: AppProps) {
         </div>
 
         <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-2 sm:col-span-2">
+            <div className="flex items-center justify-between gap-3">
+              <label className="text-[13px] font-medium tracking-wide text-white/90">Download Directory</label>
+              <button
+                type="button"
+                onClick={openDownloadDirPickerFallback}
+                className="rounded-lg border border-white/10 px-3 py-1.5 text-[11px] uppercase tracking-wider text-white/60 transition-colors hover:border-white/20 hover:text-white/85"
+              >
+                Browse...
+              </button>
+            </div>
+            <p className="text-[10px] uppercase font-mono tracking-wider text-white/40">Absolute path used for completed downloads and segment cache</p>
+            <input
+              type="text"
+              value={downloadDirInput}
+              onChange={(event) => {
+                setDownloadDirInput(event.target.value);
+                if (downloadDirError) {
+                  setDownloadDirError(null);
+                }
+              }}
+              onBlur={() => void commitDownloadDir()}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  void commitDownloadDir();
+                  (event.currentTarget as HTMLInputElement).blur();
+                }
+              }}
+              placeholder="/home/user/Downloads"
+              className="w-full bg-[#0A0A0A] border border-white/10 px-4 py-3 rounded-xl font-mono text-[13px] text-white focus:outline-none focus:border-white/30 transition-colors"
+            />
+            {downloadDirError && <p className="text-[11px] text-red-300">{downloadDirError}</p>}
+          </div>
+
           <div className="space-y-2">
             <label className="text-[13px] font-medium tracking-wide text-white/90">Global Throttle</label>
             <p className="text-[10px] uppercase font-mono tracking-wider text-white/40">KB/s across every active download, 0 disables the cap</p>
@@ -1170,6 +1284,19 @@ export default function App({ surface = 'dashboard' }: AppProps) {
                   <div className="data-value opacity-40">{typeof download.id === 'number' ? download.id.toString().padStart(2, '0') : download.id.substring(0, 4)}</div>
                   <div className="flex flex-col min-w-0 pr-4">
                     <div className="font-medium truncate text-[13px] text-white/90">{download.name || download.filename}</div>
+                    {download.output_path && (
+                      <div className="mt-1 flex items-center gap-1.5 min-w-0">
+                        <div className="truncate text-[10px] font-mono text-white/35" title={download.output_path}>{getDownloadParentDirectory(download.output_path)}</div>
+                        <button
+                          type="button"
+                          onClick={() => void copyPathToClipboard(download.output_path)}
+                          className="flex-none rounded-md p-1 text-white/35 transition-colors hover:bg-white/10 hover:text-white/80"
+                          title="Copy full output path"
+                        >
+                          <Copy className="w-3 h-3" />
+                        </button>
+                      </div>
+                    )}
                     {download.status === 'error' && (download.error || download.error_code || download.last_attempt_at) && (
                       <div className="mt-0.5">
                         {download.error && <div className="text-xs text-red-400 truncate" title={download.error}>{download.error}</div>}

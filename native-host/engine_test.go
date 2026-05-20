@@ -55,8 +55,12 @@ func TestEngineAddFallsBackToRangeProbeAndResolvesRedirects(t *testing.T) {
 	if len(state.Segments) != 4 {
 		t.Fatalf("expected 4 segments, got %d", len(state.Segments))
 	}
-	if !strings.HasSuffix(state.OutputPath, filepath.Join("downloads", "artifact.bin")) {
-		t.Fatalf("expected output path in downloads dir, got %q", state.OutputPath)
+	settings, err := storage.GetHostSettings()
+	if err != nil {
+		t.Fatalf("GetHostSettings returned error: %v", err)
+	}
+	if got := filepath.Dir(state.OutputPath); got != settings.DownloadDir {
+		t.Fatalf("expected output path in %q, got %q", settings.DownloadDir, state.OutputPath)
 	}
 }
 
@@ -160,6 +164,46 @@ func TestEngineDownloadRetriesRetryAfter(t *testing.T) {
 	}
 }
 
+func TestEngineAddUsesConfiguredDownloadDir(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	configuredDir := filepath.Join(t.TempDir(), "downloads")
+	if err := storage.SaveHostSettings(HostSettings{DownloadDir: configuredDir}); err != nil {
+		t.Fatalf("SaveHostSettings returned error: %v", err)
+	}
+	engine := NewEngine(storage, nil)
+	body := []byte("custom-dir")
+	digest := md5.Sum(body)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleRangeResponse(w, r, body, digest)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(DownloadRequest{URL: server.URL + "/custom.bin", Filename: "custom.bin", Segments: 1})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if got := filepath.Dir(state.OutputPath); got != configuredDir {
+		t.Fatalf("expected output path under %q, got %q", configuredDir, got)
+	}
+}
+
+func TestEngineUpdateHostSettingsRejectsDownloadDirInsideDataDir(t *testing.T) {
+	xdgDataHome := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", xdgDataHome)
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	dataDir, err := DataDir()
+	if err != nil {
+		t.Fatalf("DataDir returned error: %v", err)
+	}
+
+	err = engine.UpdateHostSettings(HostSettings{DownloadDir: filepath.Join(dataDir, "nested")})
+	if err == nil {
+		t.Fatal("expected download dir validation error")
+	}
+}
+
 func TestStoragePauseActiveDownloads(t *testing.T) {
 	storage := newTestStorage(t)
 	state := &DownloadState{ID: "active", Filename: "file.bin", Status: "downloading", Type: "file", CreatedAt: time.Now()}
@@ -234,7 +278,10 @@ func TestEngineUpdateHostSettingsPersistsAndRebalancesSlots(t *testing.T) {
 		GlobalThrottleBytesPerSecond:      2048,
 		PerDownloadThrottleBytesPerSecond: 1024,
 	}
-	expected := normalizeHostSettings(settings)
+	expected, err := validateHostSettingsUpdate(settings)
+	if err != nil {
+		t.Fatalf("validateHostSettingsUpdate returned error: %v", err)
+	}
 	if err := engine.UpdateHostSettings(settings); err != nil {
 		t.Fatalf("UpdateHostSettings returned error: %v", err)
 	}

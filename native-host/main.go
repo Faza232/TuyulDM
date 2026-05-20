@@ -215,7 +215,7 @@ func main() {
 				break
 			}
 
-			downloadsDir, err := DownloadsDir()
+			downloadsDir, err := ResolveDownloadDir(engine.HostSettings())
 			if err != nil {
 				resp.Status = "error"
 				resp.Message = err.Error()
