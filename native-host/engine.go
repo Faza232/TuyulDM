@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -110,9 +111,17 @@ func noteDownloadAttempt(state *DownloadState, err error) {
 
 func setDownloadFailureState(state *DownloadState, err error) {
 	state.Status = "error"
-	state.Speed = "0 B/s"
+	setDownloadSpeed(state, 0)
 	state.Error = err.Error()
 	noteDownloadAttempt(state, err)
+}
+
+func setDownloadSpeed(state *DownloadState, bytesPerSecond int64) {
+	if bytesPerSecond < 0 {
+		bytesPerSecond = 0
+	}
+	state.SpeedBytesPerSecond = bytesPerSecond
+	state.Speed = formatSpeed(bytesPerSecond)
 }
 
 func downloadErrorCode(err error) string {
@@ -168,6 +177,8 @@ type Engine struct {
 	settings      HostSettings
 	globalLimiter *rate.Limiter
 	onProgress    func(DownloadState)
+	targetMu      sync.Mutex
+	shuttingDown  bool
 	mu            sync.Mutex
 }
 
@@ -177,7 +188,7 @@ type ActiveDownload struct {
 	Cancel             context.CancelFunc
 	Done               chan struct{}
 	File               *os.File
-	PerDownloadLimiter *rate.Limiter
+	PerDownloadLimiter atomic.Pointer[rate.Limiter]
 	mu                 sync.Mutex
 }
 
@@ -220,9 +231,7 @@ func (e *Engine) UpdateHostSettings(settings HostSettings) error {
 	e.settings = normalizedSettings
 	e.globalLimiter = newRateLimiter(normalizedSettings.GlobalThrottleBytesPerSecond)
 	for _, active := range e.active {
-		active.mu.Lock()
-		active.PerDownloadLimiter = newRateLimiter(normalizedSettings.PerDownloadThrottleBytesPerSecond)
-		active.mu.Unlock()
+		active.PerDownloadLimiter.Store(newRateLimiter(normalizedSettings.PerDownloadThrottleBytesPerSecond))
 	}
 	e.rebalanceSlotPoolLocked()
 	e.mu.Unlock()
@@ -243,19 +252,15 @@ func (e *Engine) globalLimiterSnapshot() *rate.Limiter {
 	return e.globalLimiter
 }
 
-func (e *Engine) Add(req DownloadRequest) (*DownloadState, error) {
+func (e *Engine) Add(ctx context.Context, req DownloadRequest) (*DownloadState, error) {
 	if strings.TrimSpace(req.URL) == "" {
 		return nil, fmt.Errorf("url is required")
 	}
 
 	headers := sanitizeRequestHeaders(req.Headers)
 	cookies := sanitizeRequestCookies(req.Cookies)
-	metadata, err := e.probeDownload(req.URL, headers, cookies)
-	if err != nil {
-		return nil, err
-	}
-
-	filename, outputPath, err := e.resolveDownloadTarget(metadata.FinalURL, req.Filename)
+	logForwardedCookieContext(req.URL, headers, cookies)
+	metadata, err := e.probeDownload(ctx, req.URL, headers, cookies)
 	if err != nil {
 		return nil, err
 	}
@@ -264,8 +269,6 @@ func (e *Engine) Add(req DownloadRequest) (*DownloadState, error) {
 	state := &DownloadState{
 		ID:         id,
 		URL:        metadata.FinalURL,
-		Filename:   filename,
-		OutputPath: outputPath,
 		TotalSize:  metadata.TotalSize,
 		Status:     "queued",
 		Type:       "file",
@@ -278,11 +281,54 @@ func (e *Engine) Add(req DownloadRequest) (*DownloadState, error) {
 		Schedule:   cloneDownloadSchedule(req.Schedule),
 	}
 
-	if err := e.storage.SaveDownload(state); err != nil {
+	if err := e.assignDownloadTargetAndSave(state, req.Filename); err != nil {
 		return nil, err
 	}
 
 	return state, nil
+}
+
+func (e *Engine) Shutdown(ctx context.Context) error {
+	e.mu.Lock()
+	e.shuttingDown = true
+	active := make([]*ActiveDownload, 0, len(e.active))
+	for _, download := range e.active {
+		active = append(active, download)
+	}
+	e.mu.Unlock()
+
+	for _, download := range active {
+		download.Cancel()
+	}
+
+	waitDone := make(chan struct{})
+	go func() {
+		for _, download := range active {
+			<-download.Done
+		}
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (e *Engine) assignDownloadTargetAndSave(state *DownloadState, requestedName string) error {
+	e.targetMu.Lock()
+	defer e.targetMu.Unlock()
+
+	filename, outputPath, err := e.resolveDownloadTarget(state.URL, requestedName, state.ID)
+	if err != nil {
+		return err
+	}
+
+	state.Filename = filename
+	state.OutputPath = outputPath
+	return e.storage.SaveDownload(state)
 }
 
 func (e *Engine) Start(id string) error {
@@ -292,6 +338,10 @@ func (e *Engine) Start(id string) error {
 	}
 
 	e.mu.Lock()
+	if e.shuttingDown {
+		e.mu.Unlock()
+		return fmt.Errorf("engine shutting down")
+	}
 	if _, ok := e.active[id]; ok {
 		e.mu.Unlock()
 		return fmt.Errorf("already active")
@@ -300,7 +350,7 @@ func (e *Engine) Start(id string) error {
 
 	state.Status = "queued"
 	clearDownloadFailureState(state)
-	state.Speed = "0 B/s"
+	setDownloadSpeed(state, 0)
 	state.WasUserPaused = false
 	if err := e.storage.SaveDownload(state); err != nil {
 		return err
@@ -323,6 +373,7 @@ func (e *Engine) Start(id string) error {
 
 func (e *Engine) runDownload(a *ActiveDownload) {
 	defer close(a.Done)
+	defer e.persistActiveState(a)
 
 	file, err := os.OpenFile(downloadPath(a.State), os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -384,7 +435,7 @@ func (e *Engine) runDownload(a *ActiveDownload) {
 					} else {
 						a.State.Progress = 0
 					}
-					a.State.Speed = formatSpeed(diff * 2)
+					setDownloadSpeed(a.State, diff*2)
 					return cloneDownloadState(a.State)
 				}()
 
@@ -423,12 +474,12 @@ func (e *Engine) runDownload(a *ActiveDownload) {
 		} else {
 			a.State.Status = "finished"
 			a.State.Progress = 100
-			a.State.Speed = "0 B/s"
+			setDownloadSpeed(a.State, 0)
 			clearDownloadFailureState(a.State)
 		}
 	} else {
 		a.State.Status = "paused"
-		a.State.Speed = "0 B/s"
+		setDownloadSpeed(a.State, 0)
 	}
 	snapshot := cloneDownloadState(a.State)
 	a.mu.Unlock()
@@ -487,6 +538,17 @@ func (e *Engine) downloadSegment(a *ActiveDownload, idx int) error {
 	return withErrorCode("download_failed", fmt.Errorf("segment %d exhausted retries", idx))
 }
 
+func logForwardedCookieContext(requestURL string, headers map[string]string, cookies []RequestCookie) {
+	if len(cookies) != 0 {
+		return
+	}
+
+	slog.Info("0 cookies forwarded",
+		"url", requestURL,
+		"forwarded_header_count", len(headers),
+	)
+}
+
 func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int) error {
 	a.mu.Lock()
 	seg := a.State.Segments[idx]
@@ -495,7 +557,6 @@ func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int) error {
 	headers := cloneStringMap(a.State.Headers)
 	cookies := append([]RequestCookie(nil), a.State.Cookies...)
 	segmentCount := len(a.State.Segments)
-	perDownloadLimiter := a.PerDownloadLimiter
 	a.mu.Unlock()
 
 	startOffset := seg.Start + seg.Current
@@ -529,7 +590,7 @@ func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int) error {
 		return err
 	}
 	defer resp.Body.Close()
-	reader := newThrottledReader(a.Ctx, resp.Body, perDownloadLimiter, e.globalLimiterSnapshot())
+	reader := newThrottledReader(a.Ctx, resp.Body, &a.PerDownloadLimiter, e.globalLimiterSnapshot())
 
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
 		return &retryableStatusError{StatusCode: resp.StatusCode, RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
@@ -624,7 +685,7 @@ func (e *Engine) pause(id string, userInitiated bool) error {
 	}
 
 	state.Status = "paused"
-	state.Speed = "0 B/s"
+	setDownloadSpeed(state, 0)
 	state.WasUserPaused = userInitiated
 
 	e.mu.Lock()
@@ -641,7 +702,7 @@ func (e *Engine) pause(id string, userInitiated bool) error {
 	if a, ok := e.active[id]; ok {
 		a.mu.Lock()
 		a.State.Status = "paused"
-		a.State.Speed = "0 B/s"
+		setDownloadSpeed(a.State, 0)
 		a.State.WasUserPaused = userInitiated
 		a.mu.Unlock()
 		cancel = a.Cancel
@@ -665,12 +726,31 @@ func (e *Engine) Resume(id string) error {
 		return err
 	}
 
+	if shouldResetSegmentsOnResume(state) {
+		resetSegmentsForRetry(state)
+	}
 	state.WasUserPaused = false
 	if err := e.storage.SaveDownload(state); err != nil {
 		return err
 	}
 
 	return e.Start(id)
+}
+
+func shouldResetSegmentsOnResume(state *DownloadState) bool {
+	if state == nil || state.Status != "error" {
+		return false
+	}
+	return strings.TrimSpace(state.ContentMD5) != "" || strings.TrimSpace(state.Digest) != ""
+}
+
+func resetSegmentsForRetry(state *DownloadState) {
+	for index := range state.Segments {
+		state.Segments[index].Current = 0
+		state.Segments[index].Completed = false
+	}
+	state.Progress = 0
+	setDownloadSpeed(state, 0)
 }
 
 func (e *Engine) Remove(id string, deleteFile bool) error {
@@ -756,8 +836,8 @@ func (e *Engine) removeVideoArtifacts(state *DownloadState) error {
 	return nil
 }
 
-func (e *Engine) probeDownload(downloadURL string, headers map[string]string, cookies []RequestCookie) (downloadMetadata, error) {
-	headResp, finalURL, err := doRequestWithRedirects(context.Background(), http.MethodHead, downloadURL, headers, cookies, nil)
+func (e *Engine) probeDownload(ctx context.Context, downloadURL string, headers map[string]string, cookies []RequestCookie) (downloadMetadata, error) {
+	headResp, finalURL, err := doRequestWithRedirects(ctx, http.MethodHead, downloadURL, headers, cookies, nil)
 	if err != nil {
 		slog.Warn("download probe head request failed", "url", downloadURL, "error", err)
 		return downloadMetadata{}, err
@@ -771,7 +851,7 @@ func (e *Engine) probeDownload(downloadURL string, headers map[string]string, co
 		return headMeta, nil
 	}
 
-	rangeResp, rangeURL, rangeErr := doRequestWithRedirects(context.Background(), http.MethodGet, finalURL, headers, cookies, func(req *http.Request) {
+	rangeResp, rangeURL, rangeErr := doRequestWithRedirects(ctx, http.MethodGet, finalURL, headers, cookies, func(req *http.Request) {
 		req.Header.Set("Range", "bytes=0-0")
 	})
 	if rangeErr != nil {
@@ -1021,21 +1101,67 @@ func buildSegments(totalSize int64, requestedSegments int, canSegment bool) []Se
 	return segments
 }
 
-func (e *Engine) resolveDownloadTarget(downloadURL string, requestedName string) (string, string, error) {
+func (e *Engine) resolveDownloadTarget(downloadURL string, requestedName string, downloadID string) (string, string, error) {
 	downloadsDir, err := ResolveDownloadDir(e.HostSettings())
 	if err != nil {
 		return "", "", err
 	}
-	return resolveDownloadTarget(downloadURL, requestedName, downloadsDir)
+	downloads, err := e.storage.ListDownloads()
+	if err != nil {
+		return "", "", err
+	}
+	return resolveDownloadTarget(downloadURL, requestedName, downloadsDir, downloads, downloadID)
 }
 
-func resolveDownloadTarget(downloadURL string, requestedName string, downloadsDir string) (string, string, error) {
+func resolveDownloadTarget(downloadURL string, requestedName string, downloadsDir string, downloads []DownloadState, downloadID string) (string, string, error) {
 	filename := strings.TrimSpace(filepath.Base(requestedName))
 	if filename == "" || filename == "." || filename == string(filepath.Separator) {
 		filename = filenameFromURL(downloadURL)
 	}
 
-	return filename, filepath.Join(downloadsDir, filename), nil
+	stem, ext := collisionNameParts(filename)
+	for suffix := 1; ; suffix++ {
+		candidate := collisionCandidateName(stem, ext, suffix)
+		outputPath := filepath.Join(downloadsDir, candidate)
+		if outputPathReserved(downloads, outputPath, downloadID) {
+			continue
+		}
+		if _, err := os.Stat(outputPath); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return "", "", err
+		}
+		return candidate, outputPath, nil
+	}
+}
+
+func collisionNameParts(filename string) (string, string) {
+	ext := filepath.Ext(filename)
+	stem := strings.TrimSuffix(filename, ext)
+	if stem == "" {
+		return filename, ""
+	}
+	return stem, ext
+}
+
+func collisionCandidateName(stem string, ext string, suffix int) string {
+	if suffix <= 1 {
+		return stem + ext
+	}
+	return fmt.Sprintf("%s (%d)%s", stem, suffix, ext)
+}
+
+func outputPathReserved(downloads []DownloadState, outputPath string, downloadID string) bool {
+	candidate := filepath.Clean(outputPath)
+	for _, download := range downloads {
+		if download.ID == downloadID || strings.TrimSpace(download.OutputPath) == "" {
+			continue
+		}
+		if filepath.Clean(download.OutputPath) == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func filenameFromURL(rawURL string) string {
@@ -1222,6 +1348,13 @@ func (e *Engine) persistSnapshot(snapshot DownloadState) {
 	}
 }
 
+func (e *Engine) persistActiveState(a *ActiveDownload) {
+	a.mu.Lock()
+	snapshot := cloneDownloadState(a.State)
+	a.mu.Unlock()
+	e.persistSnapshot(snapshot)
+}
+
 func (e *Engine) failDownload(a *ActiveDownload, err error) {
 	e.releaseActiveSlot(a.State.ID)
 
@@ -1274,6 +1407,10 @@ func (e *Engine) rebalanceSlotPoolLocked() {
 func (e *Engine) drainQueue() {
 	for {
 		e.mu.Lock()
+		if e.shuttingDown {
+			e.mu.Unlock()
+			return
+		}
 		if len(e.queued) == 0 {
 			e.mu.Unlock()
 			return
@@ -1310,10 +1447,15 @@ func (e *Engine) startQueuedDownload(id string) error {
 		Ctx:                ctx,
 		Cancel:             cancel,
 		Done:               make(chan struct{}),
-		PerDownloadLimiter: newRateLimiter(settings.PerDownloadThrottleBytesPerSecond),
 	}
+	active.PerDownloadLimiter.Store(newRateLimiter(settings.PerDownloadThrottleBytesPerSecond))
 
 	e.mu.Lock()
+	if e.shuttingDown {
+		e.mu.Unlock()
+		cancel()
+		return fmt.Errorf("engine shutting down")
+	}
 	if _, ok := e.active[id]; ok {
 		e.mu.Unlock()
 		cancel()
@@ -1324,7 +1466,7 @@ func (e *Engine) startQueuedDownload(id string) error {
 
 	state.Status = "downloading"
 	state.Error = ""
-	state.Speed = "0 B/s"
+	setDownloadSpeed(state, 0)
 	if err := e.storage.SaveDownload(state); err != nil {
 		e.mu.Lock()
 		delete(e.active, id)
@@ -1346,8 +1488,11 @@ func (e *Engine) releaseActiveSlot(id string) {
 	e.mu.Lock()
 	delete(e.active, id)
 	e.returnAvailableSlotLocked()
+	shouldDrain := !e.shuttingDown
 	e.mu.Unlock()
-	e.drainQueue()
+	if shouldDrain {
+		e.drainQueue()
+	}
 }
 
 func (e *Engine) returnAvailableSlot() {

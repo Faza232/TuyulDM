@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"io"
+	"sync/atomic"
 
 	"golang.org/x/time/rate"
 )
@@ -12,7 +13,7 @@ const throttleChunkSize = 16 * 1024
 type throttledReader struct {
 	ctx    context.Context
 	r      io.Reader
-	perDl  *rate.Limiter
+	perDl  *atomic.Pointer[rate.Limiter]
 	global *rate.Limiter
 }
 
@@ -32,8 +33,8 @@ func newRateLimiter(bytesPerSecond int64) *rate.Limiter {
 	return rate.NewLimiter(rate.Limit(bytesPerSecond), burst)
 }
 
-func newThrottledReader(ctx context.Context, reader io.Reader, perDl *rate.Limiter, global *rate.Limiter) io.Reader {
-	if perDl == nil && global == nil {
+func newThrottledReader(ctx context.Context, reader io.Reader, perDl *atomic.Pointer[rate.Limiter], global *rate.Limiter) io.Reader {
+	if (perDl == nil || perDl.Load() == nil) && global == nil {
 		return reader
 	}
 
@@ -46,12 +47,17 @@ func newThrottledReader(ctx context.Context, reader io.Reader, perDl *rate.Limit
 }
 
 func (reader *throttledReader) Read(buffer []byte) (int, error) {
+	perDl := (*rate.Limiter)(nil)
+	if reader.perDl != nil {
+		perDl = reader.perDl.Load()
+	}
+
 	maxChunk := len(buffer)
 	if maxChunk > throttleChunkSize {
 		maxChunk = throttleChunkSize
 	}
-	if reader.perDl != nil && reader.perDl.Burst() < maxChunk {
-		maxChunk = reader.perDl.Burst()
+	if perDl != nil && perDl.Burst() < maxChunk {
+		maxChunk = perDl.Burst()
 	}
 	if reader.global != nil && reader.global.Burst() < maxChunk {
 		maxChunk = reader.global.Burst()
@@ -62,8 +68,8 @@ func (reader *throttledReader) Read(buffer []byte) (int, error) {
 
 	count, err := reader.r.Read(buffer[:maxChunk])
 	if count > 0 {
-		if reader.perDl != nil {
-			if waitErr := reader.perDl.WaitN(reader.ctx, count); waitErr != nil {
+		if perDl != nil {
+			if waitErr := perDl.WaitN(reader.ctx, count); waitErr != nil {
 				return 0, waitErr
 			}
 		}

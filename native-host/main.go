@@ -6,9 +6,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
-	"strconv"
-	"strings"
+	"syscall"
 	"time"
 )
 
@@ -31,9 +31,16 @@ type HostStatsPayload struct {
 	ActiveDownloads           int    `json:"activeDownloads"`
 }
 
+type readLoopResult struct {
+	payload []byte
+	err     error
+}
+
 func main() {
 	configureBootstrapLogger()
 	slog.Info("native host starting")
+	hostCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
 
 	dataDir, err := DataDir()
 	if err != nil {
@@ -75,29 +82,50 @@ func main() {
 	if err := scheduler.Reconcile(time.Now()); err != nil {
 		slog.Warn("initial scheduler reconcile failed", "error", err)
 	}
-	schedulerCtx, cancelScheduler := context.WithCancel(context.Background())
-	defer cancelScheduler()
+	schedulerCtx, cancelScheduler := context.WithCancel(hostCtx)
 	go scheduler.Start(schedulerCtx)
 
-	for {
-		payload, err := ReadMessage(os.Stdin)
-		if err != nil {
-			if err != io.EOF {
-				slog.Error("read message failed", "error", err)
+	readResults := make(chan readLoopResult)
+	go func() {
+		for {
+			payload, err := ReadMessage(os.Stdin)
+			readResults <- readLoopResult{payload: payload, err: err}
+			if err != nil {
+				close(readResults)
+				return
 			}
-			break
 		}
+	}()
 
-		var req Request
-		if err := json.Unmarshal(payload, &req); err != nil {
-			slog.Error("unmarshal request failed", "error", err)
-			continue
-		}
+	shutdownReason := "stdin closed"
+	readLoop:
+	for {
+		select {
+		case <-hostCtx.Done():
+			shutdownReason = "signal received"
+			break readLoop
+		case result, ok := <-readResults:
+			if !ok {
+				break readLoop
+			}
+			payload, err := result.payload, result.err
+			if err != nil {
+				if err != io.EOF {
+					slog.Error("read message failed", "error", err)
+				}
+				break readLoop
+			}
 
-		var resp Response
-		resp.ID = req.ID
+			var req Request
+			if err := json.Unmarshal(payload, &req); err != nil {
+				slog.Error("unmarshal request failed", "error", err)
+				continue
+			}
 
-		switch req.Method {
+			var resp Response
+			resp.ID = req.ID
+
+			switch req.Method {
 		case "ping":
 			resp.Status = "ok"
 			resp.Message = "pong"
@@ -108,7 +136,9 @@ func main() {
 				resp.Message = err.Error()
 				break
 			}
-			preview, err := previewVideoManifest(storageContext(), params)
+			requestCtx, cancel := context.WithCancel(hostCtx)
+			preview, err := previewVideoManifest(requestCtx, params)
+			cancel()
 			if err != nil {
 				resp.Status = "error"
 				resp.Message = err.Error()
@@ -123,7 +153,9 @@ func main() {
 				resp.Message = err.Error()
 				break
 			}
-			state, err := engine.Add(params)
+			requestCtx, cancel := context.WithCancel(hostCtx)
+			state, err := engine.Add(requestCtx, params)
+			cancel()
 			if err != nil {
 				resp.Status = "error"
 				resp.Message = err.Error()
@@ -140,7 +172,9 @@ func main() {
 				resp.Message = err.Error()
 				break
 			}
-			state, err := engine.AddVideo(params)
+			requestCtx, cancel := context.WithCancel(hostCtx)
+			state, err := engine.AddVideo(requestCtx, params)
+			cancel()
 			if err != nil {
 				resp.Status = "error"
 				resp.Message = err.Error()
@@ -405,18 +439,27 @@ func main() {
 			resp.Status = "error"
 			resp.Message = "Unknown method: " + req.Method
 			slog.Warn("unknown IPC method", "method", req.Method, "request_id", req.ID)
-		}
+			}
 
-		out, _ := json.Marshal(resp)
-		if err := WriteMessage(os.Stdout, out); err != nil {
-			slog.Error("write message failed", "error", err, "request_id", req.ID)
-			break
+			out, _ := json.Marshal(resp)
+			if err := WriteMessage(os.Stdout, out); err != nil {
+				slog.Error("write message failed", "error", err, "request_id", req.ID)
+				break readLoop
+			}
 		}
 	}
-}
 
-func storageContext() context.Context {
-	return context.Background()
+	cancelScheduler()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := engine.Shutdown(shutdownCtx); err != nil {
+		slog.Warn("engine shutdown incomplete", "reason", shutdownReason, "error", err)
+	} else {
+		slog.Info("engine shutdown complete", "reason", shutdownReason)
+	}
+	if err := storage.db.Close(); err != nil {
+		slog.Warn("storage close failed", "error", err)
+	}
 }
 
 func decodeParams(req Request, target interface{}) error {
@@ -460,7 +503,9 @@ func resumeAllDownloads(engine *Engine, downloads []DownloadState) error {
 func aggregateGlobalSpeed(downloads []DownloadState) int64 {
 	var total int64
 	for _, download := range downloads {
-		total += parseSpeedBytes(download.Speed)
+		if download.SpeedBytesPerSecond > 0 {
+			total += download.SpeedBytesPerSecond
+		}
 	}
 	return total
 }
@@ -475,25 +520,3 @@ func countActiveDownloads(downloads []DownloadState) int {
 	return count
 }
 
-func parseSpeedBytes(speed string) int64 {
-	parts := strings.Fields(strings.TrimSpace(speed))
-	if len(parts) != 2 || !strings.HasSuffix(parts[1], "/s") {
-		return 0
-	}
-
-	value, err := strconv.ParseFloat(parts[0], 64)
-	if err != nil {
-		return 0
-	}
-
-	unit := strings.TrimSuffix(strings.ToUpper(parts[1]), "/S")
-	multipliers := map[string]float64{
-		"B":  1,
-		"KB": 1024,
-		"MB": 1024 * 1024,
-		"GB": 1024 * 1024 * 1024,
-		"TB": 1024 * 1024 * 1024 * 1024,
-	}
-
-	return int64(value * multipliers[unit])
-}

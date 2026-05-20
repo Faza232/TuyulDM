@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -76,7 +77,7 @@ seg-4.ts
 	}))
 	defer server.Close()
 
-	state, err := engine.AddVideo(VideoDownloadRequest{
+	state, err := engine.AddVideo(context.Background(), VideoDownloadRequest{
 		URL:          server.URL + "/playlist.m3u8",
 		Filename:     "demo-video.mp4",
 		ManifestType: manifestTypeHLS,

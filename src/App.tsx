@@ -38,6 +38,7 @@ interface DownloadItem {
   total_size?: number;
   progress: number;
   speed: string;
+  speed_bytes_per_second?: number;
   status: 'downloading' | 'paused' | 'finished' | 'queued' | 'error' | 'muxing';
   type?: string;
   error?: string;
@@ -145,6 +146,7 @@ const DEFAULT_HOST_SETTINGS: HostSettings = {
 };
 
 const HOST_SETTINGS_STORAGE_KEY = 'tuyuldm_host_settings';
+const REPOSITORY_URL = 'https://github.com/husainfaza/TuyulDM';
 const WEEKDAY_OPTIONS = [
   { label: 'Sun', value: 0 },
   { label: 'Mon', value: 1 },
@@ -380,6 +382,19 @@ function formatSpeed(bytesPerSecond: number) {
   return `${formatSize(bytesPerSecond)}/s`;
 }
 
+function formatDownloadSpeed(download: DownloadItem) {
+  if (download.status === 'muxing') {
+    return 'Muxing';
+  }
+
+  const rawSpeed = Number(download.speed_bytes_per_second ?? 0);
+  if (Number.isFinite(rawSpeed) && rawSpeed > 0) {
+    return formatSpeed(rawSpeed);
+  }
+
+  return download.speed || '0 B/s';
+}
+
 function formatAttemptTimestamp(value: string | undefined) {
   if (!value) {
     return 'unknown';
@@ -406,6 +421,15 @@ function formatDetectedTimestamp(value: number | undefined) {
 
 function formatGrantedOrigin(origin: string) {
   return origin === '<all_urls>' ? 'All sites (<all_urls>)' : origin;
+}
+
+function isValidDownloadUrl(value: string) {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
 }
 
 function getDownloadParentDirectory(outputPath: string | undefined) {
@@ -664,6 +688,9 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     setScheduleDays((previous) => toggleScheduleDayValue(previous, day));
   };
 
+  const normalizedUrlInput = urlInput.trim();
+  const canAddDownload = isValidDownloadUrl(normalizedUrlInput);
+
   useEffect(() => {
     void loadInterceptionSettings();
     void loadHostSettings();
@@ -728,7 +755,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
   }, []);
 
   const addDownload = async () => {
-    if (!urlInput) {
+    if (!canAddDownload) {
       return;
     }
 
@@ -737,7 +764,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     if (isExtensionRuntimeAvailable()) {
       await sendExtensionMessage({
         type: 'START_DOWNLOAD',
-        url: urlInput,
+        url: normalizedUrlInput,
         segments: segmentsCount,
         schedule,
       });
@@ -746,7 +773,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
       const response = await fetch('/api/downloads', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: urlInput, segments: segmentsCount, schedule }),
+        body: JSON.stringify({ url: normalizedUrlInput, segments: segmentsCount, schedule }),
       });
       const newDownload = await response.json();
       setDownloads([...downloads, newDownload]);
@@ -769,7 +796,12 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     setDownloads(
       downloads.map((download) =>
         download.id === id
-          ? { ...download, status: currentStatus === 'downloading' || currentStatus === 'muxing' ? 'paused' : 'downloading' }
+          ? {
+            ...download,
+            status: currentStatus === 'downloading' || currentStatus === 'muxing' ? 'paused' : 'downloading',
+            speed: '0 B/s',
+            speed_bytes_per_second: 0,
+          }
           : download,
       ),
     );
@@ -1079,6 +1111,10 @@ export default function App({ surface = 'dashboard' }: AppProps) {
   const activeConnections = downloads.filter(
     (download) => download.status === 'downloading' || download.status === 'queued' || download.status === 'muxing',
   ).length * segmentsCount;
+
+  const openRepository = () => {
+    window.open(REPOSITORY_URL, '_blank', 'noopener,noreferrer');
+  };
 
   const settingsSections = (
     <>
@@ -1742,7 +1778,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
         <div className="p-4 border-t border-white/5 space-y-1">
           <SidebarItem icon={<Activity className="w-4 h-4" />} label="Logs" onClick={() => void openLogs()} />
           <SidebarItem icon={<Settings className="w-4 h-4" />} label="Settings" onClick={() => setIsSettingsOpen(true)} />
-          <SidebarItem icon={<Github className="w-4 h-4" />} label="Source Code" />
+          <SidebarItem icon={<Github className="w-4 h-4" />} label="Source Code" onClick={openRepository} />
         </div>
       </aside>
 
@@ -1788,15 +1824,32 @@ export default function App({ surface = 'dashboard' }: AppProps) {
 
               <AnimatePresence>
                 <div className="p-3 space-y-1">
-                  {filteredDownloads.map((download) => (
-                <motion.div
-                  key={download.id}
-                  layout
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, scale: 0.95 }}
-                  className="data-row grid grid-cols-[40px_1fr_120px_180px_120px_160px] gap-4 px-3 py-3 items-center group"
-                >
+                  {filteredDownloads.length === 0 ? (
+                    <div className="rounded-3xl border border-white/10 bg-white/2 px-6 py-12 text-center">
+                      <p className="text-[10px] font-mono uppercase tracking-widest text-white/40">Queue Empty</p>
+                      <h2 className="mt-3 text-lg font-semibold text-white">Nothing downloading yet</h2>
+                      <p className="mt-2 text-sm leading-6 text-white/60">
+                        Add a direct URL to start now. Browser-intercepted downloads will also appear here automatically.
+                      </p>
+                      <div className="mt-6 flex justify-center">
+                        <button
+                          type="button"
+                          onClick={() => setIsAdding(true)}
+                          className="inline-flex items-center gap-2 rounded-xl bg-white px-4 py-2 text-sm font-medium text-black transition-colors hover:bg-white/90"
+                        >
+                          <Plus className="w-4 h-4" /> Add URL
+                        </button>
+                      </div>
+                    </div>
+                  ) : filteredDownloads.map((download) => (
+                    <motion.div
+                      key={download.id}
+                      layout
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, scale: 0.95 }}
+                      className="data-row grid grid-cols-[40px_1fr_120px_180px_120px_160px] gap-4 px-3 py-3 items-center group"
+                    >
                   <div className="data-value opacity-40">{typeof download.id === 'number' ? download.id.toString().padStart(2, '0') : download.id.substring(0, 4)}</div>
                   <div className="flex flex-col min-w-0 pr-4">
                     <div className="font-medium truncate text-[13px] text-white/90">{download.name || download.filename}</div>
@@ -1841,7 +1894,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
                       />
                     </div>
                   </div>
-                  <div className="data-value">{download.speed}</div>
+                  <div className="data-value">{formatDownloadSpeed(download)}</div>
                   <div className="relative flex gap-2">
                     <button
                       type="button"
@@ -1966,6 +2019,9 @@ export default function App({ surface = 'dashboard' }: AppProps) {
                     placeholder="https://example.com/file.iso"
                     className="w-full bg-[#0A0A0A] border border-white/10 px-4 py-3 rounded-xl font-mono text-[13px] text-white focus:outline-none focus:border-white/30 transition-colors"
                   />
+                  {normalizedUrlInput && !canAddDownload && (
+                    <p className="mt-2 text-[11px] text-amber-200">Enter valid http(s) URL before starting download.</p>
+                  )}
                 </div>
                 <div className="rounded-2xl border border-white/10 bg-white/[0.02] p-4 space-y-4">
                   <div className="flex items-start justify-between gap-4">
@@ -2042,7 +2098,11 @@ export default function App({ surface = 'dashboard' }: AppProps) {
                   <button onClick={resetAddDownloadForm} className="px-6 py-3 border border-white/10 text-white/70 rounded-xl font-medium hover:bg-white/5 transition-colors">
                     Cancel
                   </button>
-                  <button onClick={() => void addDownload()} className="flex-1 py-3 bg-white text-black rounded-xl font-medium hover:bg-white/90 transition-colors shadow-sm">
+                  <button
+                    onClick={() => void addDownload()}
+                    disabled={!canAddDownload}
+                    className="flex-1 py-3 bg-white text-black rounded-xl font-medium hover:bg-white/90 transition-colors shadow-sm disabled:cursor-not-allowed disabled:bg-white/20 disabled:text-white/40 disabled:hover:bg-white/20"
+                  >
                     Start Download
                   </button>
                 </div>

@@ -27,14 +27,15 @@ type videoTrackInput struct {
 	Path  string
 }
 
-func (e *Engine) AddVideo(req VideoDownloadRequest) (*DownloadState, error) {
+func (e *Engine) AddVideo(ctx context.Context, req VideoDownloadRequest) (*DownloadState, error) {
 	if strings.TrimSpace(req.URL) == "" {
 		return nil, fmt.Errorf("url is required")
 	}
 
 	headers := sanitizeRequestHeaders(req.Headers)
 	cookies := sanitizeRequestCookies(req.Cookies)
-	manifest, err := resolveVideoManifest(context.Background(), VideoDownloadRequest{
+	logForwardedCookieContext(req.URL, headers, cookies)
+	manifest, err := resolveVideoManifest(ctx, VideoDownloadRequest{
 		URL:               req.URL,
 		Filename:          req.Filename,
 		ManifestType:      req.ManifestType,
@@ -44,11 +45,6 @@ func (e *Engine) AddVideo(req VideoDownloadRequest) (*DownloadState, error) {
 		Cookies:           cookies,
 		Schedule:          req.Schedule,
 	})
-	if err != nil {
-		return nil, err
-	}
-
-	filename, outputPath, err := e.resolveDownloadTarget(req.URL, ensureVideoFilename(req.Filename))
 	if err != nil {
 		return nil, err
 	}
@@ -67,8 +63,6 @@ func (e *Engine) AddVideo(req VideoDownloadRequest) (*DownloadState, error) {
 	state := &DownloadState{
 		ID:                id,
 		URL:               req.URL,
-		Filename:          filename,
-		OutputPath:        outputPath,
 		TotalSize:         totalSize,
 		Status:            "queued",
 		Type:              "video",
@@ -84,7 +78,7 @@ func (e *Engine) AddVideo(req VideoDownloadRequest) (*DownloadState, error) {
 		Schedule:          cloneDownloadSchedule(req.Schedule),
 	}
 
-	if err := e.storage.SaveDownload(state); err != nil {
+	if err := e.assignDownloadTargetAndSave(state, ensureVideoFilename(req.Filename)); err != nil {
 		return nil, err
 	}
 
@@ -128,6 +122,7 @@ func totalKnownSegmentBytes(segments []Segment) (int64, bool) {
 
 func (e *Engine) runVideoDownload(a *ActiveDownload) {
 	defer close(a.Done)
+	defer e.persistActiveState(a)
 
 	segmentDir, err := e.videoSegmentDir(a.State)
 	if err != nil {
@@ -195,11 +190,11 @@ func (e *Engine) runVideoDownload(a *ActiveDownload) {
 		} else {
 			setDownloadFailureState(a.State, err)
 		}
-		a.State.Speed = "0 B/s"
+		setDownloadSpeed(a.State, 0)
 	} else {
 		a.State.Status = "finished"
 		a.State.Progress = 100
-		a.State.Speed = "0 B/s"
+		setDownloadSpeed(a.State, 0)
 		clearDownloadFailureState(a.State)
 		if info, statErr := os.Stat(downloadPath(a.State)); statErr == nil {
 			a.State.TotalSize = info.Size()
@@ -232,7 +227,7 @@ func (e *Engine) reportVideoProgress(a *ActiveDownload, done <-chan struct{}) {
 				} else {
 					a.State.Progress = videoSegmentProgress(a.State)
 				}
-				a.State.Speed = formatSpeed(diff * 2)
+				setDownloadSpeed(a.State, diff*2)
 				return cloneDownloadState(a.State)
 			}()
 
@@ -325,7 +320,6 @@ func (e *Engine) downloadVideoSegmentAttempt(a *ActiveDownload, idx int, segment
 	downloadID := a.State.ID
 	headers := cloneStringMap(a.State.Headers)
 	cookies := append([]RequestCookie(nil), a.State.Cookies...)
-	perDownloadLimiter := a.PerDownloadLimiter
 	a.mu.Unlock()
 
 	if segment.Completed {
@@ -377,7 +371,7 @@ func (e *Engine) downloadVideoSegmentAttempt(a *ActiveDownload, idx int, segment
 		return err
 	}
 	defer resp.Body.Close()
-	reader := newThrottledReader(a.Ctx, resp.Body, perDownloadLimiter, e.globalLimiterSnapshot())
+	reader := newThrottledReader(a.Ctx, resp.Body, &a.PerDownloadLimiter, e.globalLimiterSnapshot())
 
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
 		return &retryableStatusError{StatusCode: resp.StatusCode, RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
@@ -582,6 +576,7 @@ func trackContainerExt(state *DownloadState, track string) string {
 func (e *Engine) muxVideoSegments(a *ActiveDownload, inputs []videoTrackInput, output string) error {
 	a.mu.Lock()
 	a.State.Status = "muxing"
+	setDownloadSpeed(a.State, 0)
 	a.State.Speed = "muxing"
 	snapshot := cloneDownloadState(a.State)
 	a.mu.Unlock()

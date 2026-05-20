@@ -19,6 +19,7 @@ type DownloadState struct {
 	Status            string            `json:"status"`
 	Progress          float64           `json:"progress"`
 	Speed             string            `json:"speed"`
+	SpeedBytesPerSecond int64           `json:"speed_bytes_per_second,omitempty"`
 	Type              string            `json:"type"` // "file" or "video"
 	Error             string            `json:"error,omitempty"`
 	ErrorCode         string            `json:"error_code,omitempty"`
@@ -184,6 +185,7 @@ func (s *Storage) PauseActiveDownloads() error {
 
 			d.Status = "paused"
 			d.Speed = "0 B/s"
+			d.SpeedBytesPerSecond = 0
 			d.WasUserPaused = false
 			data, err := json.Marshal(&d)
 			if err != nil {

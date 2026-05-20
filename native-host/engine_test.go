@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"fmt"
@@ -37,7 +38,7 @@ func TestEngineAddFallsBackToRangeProbeAndResolvesRedirects(t *testing.T) {
 	}))
 	defer server.Close()
 
-	state, err := engine.Add(DownloadRequest{
+	state, err := engine.Add(context.Background(), DownloadRequest{
 		URL:      server.URL + "/redirect",
 		Filename: "artifact.bin",
 		Segments: 4,
@@ -94,7 +95,7 @@ func TestEngineDownloadUsesForwardedHeadersAndCookies(t *testing.T) {
 	}))
 	defer server.Close()
 
-	state, err := engine.Add(DownloadRequest{
+	state, err := engine.Add(context.Background(), DownloadRequest{
 		URL:      server.URL + "/secure.bin",
 		Filename: "secure.bin",
 		Segments: 4,
@@ -147,7 +148,7 @@ func TestEngineDownloadRetriesRetryAfter(t *testing.T) {
 	}))
 	defer server.Close()
 
-	state, err := engine.Add(DownloadRequest{URL: server.URL + "/retry.bin", Filename: "retry.bin", Segments: 2})
+	state, err := engine.Add(context.Background(), DownloadRequest{URL: server.URL + "/retry.bin", Filename: "retry.bin", Segments: 2})
 	if err != nil {
 		t.Fatalf("Add returned error: %v", err)
 	}
@@ -179,12 +180,82 @@ func TestEngineAddUsesConfiguredDownloadDir(t *testing.T) {
 	}))
 	defer server.Close()
 
-	state, err := engine.Add(DownloadRequest{URL: server.URL + "/custom.bin", Filename: "custom.bin", Segments: 1})
+	state, err := engine.Add(context.Background(), DownloadRequest{URL: server.URL + "/custom.bin", Filename: "custom.bin", Segments: 1})
 	if err != nil {
 		t.Fatalf("Add returned error: %v", err)
 	}
 	if got := filepath.Dir(state.OutputPath); got != configuredDir {
 		t.Fatalf("expected output path under %q, got %q", configuredDir, got)
+	}
+}
+
+func TestEngineAddAvoidsFilenameCollisionWithExistingFile(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	configuredDir := filepath.Join(t.TempDir(), "downloads")
+	if err := os.MkdirAll(configuredDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := storage.SaveHostSettings(HostSettings{DownloadDir: configuredDir}); err != nil {
+		t.Fatalf("SaveHostSettings returned error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(configuredDir, "setup.exe"), []byte("existing"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	engine := NewEngine(storage, nil)
+	body := []byte("collision")
+	digest := md5.Sum(body)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleRangeResponse(w, r, body, digest)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{URL: server.URL + "/setup.exe", Filename: "setup.exe", Segments: 1})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if state.Filename != "setup (2).exe" {
+		t.Fatalf("expected deduped filename, got %q", state.Filename)
+	}
+	if state.OutputPath != filepath.Join(configuredDir, "setup (2).exe") {
+		t.Fatalf("expected deduped output path, got %q", state.OutputPath)
+	}
+}
+
+func TestEngineAddAvoidsFilenameCollisionWithPersistedDownload(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	configuredDir := filepath.Join(t.TempDir(), "downloads")
+	if err := os.MkdirAll(configuredDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := storage.SaveHostSettings(HostSettings{DownloadDir: configuredDir}); err != nil {
+		t.Fatalf("SaveHostSettings returned error: %v", err)
+	}
+	if err := storage.SaveDownload(&DownloadState{
+		ID:         "existing",
+		Filename:   "setup.exe",
+		OutputPath: filepath.Join(configuredDir, "setup.exe"),
+		Status:     "queued",
+		Type:       "file",
+		CreatedAt:  time.Now(),
+	}); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+	engine := NewEngine(storage, nil)
+	body := []byte("persisted-collision")
+	digest := md5.Sum(body)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleRangeResponse(w, r, body, digest)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{URL: server.URL + "/setup.exe", Filename: "setup.exe", Segments: 1})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if state.Filename != "setup (2).exe" {
+		t.Fatalf("expected deduped filename, got %q", state.Filename)
 	}
 }
 
@@ -431,7 +502,7 @@ func TestEngineRemoveActiveDownloadWaitsForCancellation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	state, err := engine.Add(DownloadRequest{URL: server.URL + "/active.bin", Filename: "active.bin", Segments: 1})
+	state, err := engine.Add(context.Background(), DownloadRequest{URL: server.URL + "/active.bin", Filename: "active.bin", Segments: 1})
 	if err != nil {
 		t.Fatalf("Add returned error: %v", err)
 	}
@@ -479,7 +550,7 @@ func TestEngineAddPersistsSchedule(t *testing.T) {
 	defer server.Close()
 
 	schedule := &DownloadSchedule{StartHour: 2, EndHour: 6, Days: []int{1, 2, 3}}
-	state, err := engine.Add(DownloadRequest{
+	state, err := engine.Add(context.Background(), DownloadRequest{
 		URL:      server.URL + "/schedule.bin",
 		Filename: "schedule.bin",
 		Segments: 1,
@@ -508,6 +579,120 @@ func TestEngineAddPersistsSchedule(t *testing.T) {
 	}
 	if persisted.Schedule.StartHour != schedule.StartHour || persisted.Schedule.EndHour != schedule.EndHour {
 		t.Fatalf("unexpected persisted schedule hours: %+v", persisted.Schedule)
+	}
+}
+
+func TestEngineAddHonorsCanceledContext(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	body := []byte("cancel-me")
+	digest := md5.Sum(body)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleRangeResponse(w, r, body, digest)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := engine.Add(ctx, DownloadRequest{URL: server.URL + "/cancel.bin", Filename: "cancel.bin", Segments: 1}); err == nil {
+		t.Fatal("expected canceled context error")
+	}
+}
+
+func TestEngineShutdownCancelsActiveDownloads(t *testing.T) {
+	t.Setenv("XDG_DOWNLOAD_DIR", filepath.Join(t.TempDir(), "downloads"))
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	requestStarted := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "1024")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Header.Get("Range") != "" {
+			w.Header().Set("Content-Range", "bytes 0-0/1024")
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("x"))
+			return
+		}
+		requestStarted <- struct{}{}
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{URL: server.URL + "/shutdown.bin", Filename: "shutdown.bin", Segments: 1})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if err := engine.Start(state.ID); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for active request")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := engine.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Shutdown returned error: %v", err)
+	}
+
+	final := waitForTerminalState(t, storage, state.ID)
+	if final.Status != "paused" {
+		t.Fatalf("expected paused download after shutdown, got %q", final.Status)
+	}
+}
+
+func TestEngineResumeAfterIntegrityErrorResetsSegments(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	for len(engine.slotPool) > 0 {
+		<-engine.slotPool
+	}
+
+	state := &DownloadState{
+		ID:        "integrity-retry",
+		URL:       "https://example.com/file.bin",
+		Filename:  "file.bin",
+		Status:    "error",
+		Type:      "file",
+		CreatedAt: time.Now(),
+		ContentMD5: "dGVzdA==",
+		Segments: []Segment{
+			{Index: 0, Start: 0, End: 9, Current: 10, Completed: true},
+			{Index: 1, Start: 10, End: 19, Current: 5, Completed: false},
+		},
+	}
+	if err := storage.SaveDownload(state); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+
+	if err := engine.Resume(state.ID); err != nil {
+		t.Fatalf("Resume returned error: %v", err)
+	}
+
+	updated, err := storage.GetDownload(state.ID)
+	if err != nil {
+		t.Fatalf("GetDownload returned error: %v", err)
+	}
+	if updated.Status != "queued" {
+		t.Fatalf("expected queued status after resume, got %q", updated.Status)
+	}
+	for index, segment := range updated.Segments {
+		if segment.Current != 0 {
+			t.Fatalf("expected segment %d current reset, got %d", index, segment.Current)
+		}
+		if segment.Completed {
+			t.Fatalf("expected segment %d completion reset", index)
+		}
 	}
 }
 

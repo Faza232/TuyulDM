@@ -52,7 +52,6 @@ type PermissionStatusPayload = {
 };
 
 let port: any | null = null;
-let progressInterval: ReturnType<typeof setInterval> | null = null;
 const activeDownloads = new Set<string>();
 const recentRequestHeaders = new Map<string, { headers: Record<string, string>; expiresAt: number }>();
 const pendingRequests = new Map<number, { resolve: (response: any) => void; reject: (error: Error) => void }>();
@@ -73,6 +72,23 @@ function broadcastRuntimeMessage(message: Record<string, unknown>) {
 function updateHostStatus(nextStatus: Partial<typeof hostStatus>) {
   hostStatus = { ...hostStatus, ...nextStatus };
   broadcastRuntimeMessage({ type: 'HOST_STATUS', payload: hostStatus });
+}
+
+function isActiveDownloadStatus(status: unknown) {
+  return status === 'downloading' || status === 'queued' || status === 'muxing';
+}
+
+function syncActiveDownloadsFromList(downloads: unknown) {
+  activeDownloads.clear();
+  if (!Array.isArray(downloads)) {
+    return;
+  }
+
+  for (const download of downloads) {
+    if (download?.id && isActiveDownloadStatus(download?.status)) {
+      activeDownloads.add(String(download.id));
+    }
+  }
 }
 
 function normalizeGrantedOrigins(origins: unknown) {
@@ -421,6 +437,16 @@ async function ensureOriginPermission(url: string) {
   }
 }
 
+async function hasOriginPermission(url: string) {
+  const originPattern = getOriginPattern(url);
+  if (!originPattern) {
+    return false;
+  }
+
+  return browserApi.permissions.contains({ origins: ['<all_urls>'] })
+    || browserApi.permissions.contains({ origins: [originPattern] });
+}
+
 browserApi.runtime.onInstalled?.addListener((details: any) => {
   if (details?.reason === 'install') {
     void browserApi.storage.local.remove(PERMISSION_ONBOARDING_DISMISSED_KEY).catch(() => {
@@ -550,9 +576,14 @@ async function buildForwardedRequestContext(url: string, referer = '') {
     headers['User-Agent'] = navigator.userAgent;
   }
 
+  const cookies = await getCookiesForUrl(url);
+  if (cookies.length === 0 && await hasOriginPermission(url)) {
+    console.warn('0 cookies forwarded for request context:', url, Object.keys(headers));
+  }
+
   return {
     headers,
-    cookies: await getCookiesForUrl(url),
+    cookies,
   };
 }
 
@@ -573,7 +604,7 @@ function handleHostResponse(response: any) {
     broadcastRuntimeMessage({ type: 'PROGRESS_UPDATE', payload });
 
     if (payload?.id) {
-      if (payload.status === 'downloading' || payload.status === 'queued' || payload.status === 'muxing') {
+      if (isActiveDownloadStatus(payload.status)) {
         activeDownloads.add(String(payload.id));
       } else {
         activeDownloads.delete(String(payload.id));
@@ -583,6 +614,7 @@ function handleHostResponse(response: any) {
   }
 
   if (Array.isArray(response?.payload)) {
+    syncActiveDownloadsFromList(response.payload);
     broadcastRuntimeMessage({ type: 'LIST_UPDATE', payload: response.payload });
     return;
   }
@@ -591,7 +623,7 @@ function handleHostResponse(response: any) {
     const payload = response.payload;
     broadcastRuntimeMessage({ type: 'PROGRESS_UPDATE', payload });
 
-    if (payload.status === 'downloading' || payload.status === 'queued' || payload.status === 'muxing') {
+    if (isActiveDownloadStatus(payload.status)) {
       activeDownloads.add(String(payload.id));
     } else {
       activeDownloads.delete(String(payload.id));
@@ -620,32 +652,16 @@ function connectToHost() {
     port.onDisconnect.addListener(() => {
       const lastError = browser.runtime.lastError?.message ?? 'Native host disconnected';
       port = null;
-      if (progressInterval) {
-        clearInterval(progressInterval);
-        progressInterval = null;
-      }
+      activeDownloads.clear();
       updateHostStatus({ connected: false, lastError });
       rejectPendingRequests(lastError);
     });
 
     updateHostStatus({ connected: true, lastError: null });
     port.postMessage({ method: 'ping', params: { data: 'Hello from Chrome' }, id: 1 });
-
-    if (progressInterval) {
-      clearInterval(progressInterval);
-    }
-    progressInterval = setInterval(() => {
-      if (!port) {
-        return;
-      }
-      for (const id of activeDownloads) {
-        port.postMessage({
-          method: 'download.getProgress',
-          params: { id },
-          id: Date.now(),
-        });
-      }
-    }, 1000);
+    void sendHostRequest('download.list').catch((error) => {
+      console.warn('Failed to refresh downloads after host connect:', error);
+    });
 
     return true;
   } catch (error) {
