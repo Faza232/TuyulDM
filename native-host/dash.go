@@ -387,22 +387,35 @@ func buildDASHTimelineSegments(ref dashRepresentationRef, baseURL string, templa
 }
 
 func hasProtectedDASHContent(document dashManifestDocument) bool {
-	if len(document.ContentProtection) > 0 {
+	if dashContentProtectionsProtected(document.ContentProtection) {
 		return true
 	}
 	for _, period := range document.Periods {
-		if len(period.ContentProtection) > 0 {
+		if dashContentProtectionsProtected(period.ContentProtection) {
 			return true
 		}
 		for _, adaptation := range period.AdaptationSets {
-			if len(adaptation.ContentProtection) > 0 {
+			if dashContentProtectionsProtected(adaptation.ContentProtection) {
 				return true
 			}
 			for _, representation := range adaptation.Representations {
-				if len(representation.ContentProtection) > 0 {
+				if dashContentProtectionsProtected(representation.ContentProtection) {
 					return true
 				}
 			}
+		}
+	}
+	return false
+}
+
+func dashContentProtectionsProtected(values []dashContentProtection) bool {
+	for _, value := range values {
+		scheme := strings.ToLower(strings.TrimSpace(value.SchemeIDURI))
+		switch scheme {
+		case "", "urn:mpeg:dash:mp4protection:2011":
+			continue
+		default:
+			return true
 		}
 	}
 	return false

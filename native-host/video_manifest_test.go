@@ -67,6 +67,70 @@ segment-2.m4s
 	}
 }
 
+func TestResolveVideoManifestHLSUsesSelectedVariantSegments(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/master.m3u8":
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			_, _ = w.Write([]byte(`#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=640000,RESOLUTION=640x360
+low/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1280000,RESOLUTION=1280x720
+high/index.m3u8
+`))
+		case "/low/index.m3u8":
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			_, _ = w.Write([]byte(`#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:6
+#EXTINF:5.005,
+low-segment-1.ts
+#EXTINF:5.005,
+low-segment-2.ts
+#EXT-X-ENDLIST
+`))
+		case "/high/index.m3u8":
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			_, _ = w.Write([]byte(`#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:6
+#EXTINF:5.005,
+high-segment-1.ts
+#EXTINF:5.005,
+high-segment-2.ts
+#EXT-X-ENDLIST
+`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	manifest, err := resolveVideoManifest(context.Background(), VideoDownloadRequest{
+		URL:               server.URL + "/master.m3u8",
+		ManifestType:      manifestTypeHLS,
+		SelectedVariantID: "hls-0",
+	})
+	if err != nil {
+		t.Fatalf("resolveVideoManifest returned error: %v", err)
+	}
+
+	if manifest.SelectedVariantID != "hls-0" {
+		t.Fatalf("expected selected variant hls-0, got %q", manifest.SelectedVariantID)
+	}
+	for _, segment := range manifest.Segments {
+		if segment.Track != "muxed" {
+			continue
+		}
+		if segment.URL == server.URL+"/high/high-segment-1.ts" || segment.URL == server.URL+"/high/high-segment-2.ts" {
+			t.Fatalf("selected low variant unexpectedly included high variant segment %q", segment.URL)
+		}
+	}
+	if manifest.Segments[0].URL != server.URL+"/low/low-segment-1.ts" {
+		t.Fatalf("expected low variant first segment, got %q", manifest.Segments[0].URL)
+	}
+}
+
 func TestResolveVideoManifestRejectsProtectedHLS(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`#EXTM3U
@@ -165,5 +229,36 @@ func TestResolveVideoManifestRejectsProtectedDASH(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected protected DASH manifest to fail")
+	}
+}
+
+func TestResolveVideoManifestAllowsClearDashProtectionMetadata(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT4S" xmlns="urn:mpeg:dash:schema:mpd:2011">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cenc" />
+      <Representation id="video-main" bandwidth="900000" codecs="avc1.4d401f">
+        <SegmentTemplate initialization="$RepresentationID$/init.mp4" media="$RepresentationID$/chunk-$Number$.m4s" timescale="1" duration="2" startNumber="1" />
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>`))
+	}))
+	defer server.Close()
+
+	manifest, err := resolveVideoManifest(context.Background(), VideoDownloadRequest{
+		URL:          server.URL,
+		ManifestType: manifestTypeDASH,
+	})
+	if err != nil {
+		t.Fatalf("resolveVideoManifest returned error: %v", err)
+	}
+	if manifest.SelectedVariantID != "video-main" {
+		t.Fatalf("expected selected variant video-main, got %q", manifest.SelectedVariantID)
+	}
+	if len(manifest.Segments) == 0 {
+		t.Fatal("expected dash manifest to produce segments")
 	}
 }

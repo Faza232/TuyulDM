@@ -4,124 +4,391 @@ type OverlayDownloadSchedule = {
   days: number[];
 };
 
-export function injectDetectedManifestOverlay(url: string, manifestType: string, defaultSchedule?: OverlayDownloadSchedule) {
-  const overlayId = 'tuyuldm-video-overlay';
-  const existingOverlay = document.getElementById(overlayId);
-  if (existingOverlay) {
-    existingOverlay.remove();
+type DetectedManifest = {
+  url: string;
+  manifestType: 'HLS' | 'DASH';
+};
+
+type RuntimeLike = {
+  sendMessage?: (message: Record<string, unknown>, callback?: (response: unknown) => void) => Promise<unknown> | void;
+  onMessage?: {
+    addListener: (listener: (message: any, sender: any, sendResponse: (response?: any) => void) => boolean | void) => void;
+  };
+  getURL?: (path: string) => string;
+  lastError?: { message?: string };
+};
+
+declare global {
+  interface Window {
+    __TUYULDM_CONTENT_READY__?: boolean;
+  }
+}
+
+const OVERLAY_HOST_ID = 'tuyuldm-video-overlay-host';
+const OVERLAY_AUTO_DISMISS_MS = 5 * 60_000;
+const DRM_POLICY_HASH = 'options.html#drm-policy';
+const WEEKDAY_OPTIONS = [
+  { label: 'Su', value: 0 },
+  { label: 'Mo', value: 1 },
+  { label: 'Tu', value: 2 },
+  { label: 'We', value: 3 },
+  { label: 'Th', value: 4 },
+  { label: 'Fr', value: 5 },
+  { label: 'Sa', value: 6 },
+];
+
+function getRuntime(): RuntimeLike | null {
+  const browserRuntime = (globalThis as any).browser?.runtime;
+  if (browserRuntime?.sendMessage) {
+    return browserRuntime;
   }
 
-  const weekdayOptions = [
-    { label: 'Su', value: 0 },
-    { label: 'Mo', value: 1 },
-    { label: 'Tu', value: 2 },
-    { label: 'We', value: 3 },
-    { label: 'Th', value: 4 },
-    { label: 'Fr', value: 5 },
-    { label: 'Sa', value: 6 },
-  ];
+  const chromeRuntime = (globalThis as any).chrome?.runtime;
+  return chromeRuntime?.sendMessage ? chromeRuntime : null;
+}
 
-  function normalizeScheduleHour(value: number) {
-    if (!Number.isFinite(value)) {
-      return 0;
-    }
-    return Math.min(23, Math.max(0, Math.round(value)));
+function sendRuntimeMessage(message: Record<string, unknown>) {
+  const browserRuntime = (globalThis as any).browser?.runtime;
+  if (browserRuntime?.sendMessage) {
+    return browserRuntime.sendMessage(message);
   }
 
-  function normalizeScheduleDays(days: number[] | undefined) {
-    if (!Array.isArray(days) || days.length === 0) {
-      return weekdayOptions.map((option) => option.value);
+  const chromeRuntime = (globalThis as any).chrome?.runtime;
+  return new Promise<any>((resolve, reject) => {
+    if (!chromeRuntime?.sendMessage) {
+      reject(new Error('Extension runtime unavailable'));
+      return;
     }
 
-    return Array.from(
-      new Set(days.map((day) => Math.min(6, Math.max(0, Math.round(day))))),
-    ).sort((left, right) => left - right);
-  }
-
-  function toggleScheduleDay(days: number[], day: number) {
-    if (days.includes(day)) {
-      if (days.length === 1) {
-        return days;
-      }
-      return days.filter((value) => value !== day);
-    }
-    return [...days, day].sort((left, right) => left - right);
-  }
-
-  function sendRuntimeMessage(message: Record<string, unknown>) {
-    const browserRuntime = (globalThis as any).browser?.runtime;
-    if (browserRuntime?.sendMessage) {
-      return browserRuntime.sendMessage(message);
-    }
-
-    const chromeRuntime = (globalThis as any).chrome?.runtime;
-    return new Promise<any>((resolve, reject) => {
-      if (!chromeRuntime?.sendMessage) {
-        reject(new Error('Extension runtime unavailable'));
+    chromeRuntime.sendMessage(message, (response: unknown) => {
+      const lastError = chromeRuntime.lastError;
+      if (lastError?.message) {
+        reject(new Error(lastError.message));
         return;
       }
-
-      chromeRuntime.sendMessage(message, (response: any) => {
-        const lastError = chromeRuntime.lastError;
-        if (lastError) {
-          reject(new Error(lastError.message));
-          return;
-        }
-        resolve(response);
-      });
+      resolve(response);
     });
+  });
+}
+
+function detectManifestTypeFromUrl(rawUrl: unknown): DetectedManifest['manifestType'] | null {
+  const url = String(rawUrl || '').trim().toLowerCase();
+  if (!url) {
+    return null;
+  }
+  if (url.includes('.m3u8')) {
+    return 'HLS';
+  }
+  if (url.includes('.mpd')) {
+    return 'DASH';
+  }
+  return null;
+}
+
+function normalizeScheduleHour(value: number) {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.min(23, Math.max(0, Math.round(value)));
+}
+
+function normalizeScheduleDays(days: number[] | undefined) {
+  if (!Array.isArray(days) || days.length === 0) {
+    return WEEKDAY_OPTIONS.map((option) => option.value);
   }
 
-  const overlay = document.createElement('div');
-  overlay.id = overlayId;
-  overlay.style.position = 'fixed';
-  overlay.style.top = '20px';
-  overlay.style.right = '20px';
-  overlay.style.zIndex = '999999';
-  overlay.style.backgroundColor = '#141414';
-  overlay.style.color = '#E4E3E0';
-  overlay.style.padding = '12px 16px';
-  overlay.style.borderRadius = '8px';
-  overlay.style.fontFamily = 'monospace';
-  overlay.style.fontSize = '12px';
-  overlay.style.boxShadow = '0 4px 12px rgba(0,0,0,0.3)';
-  overlay.style.display = 'flex';
-  overlay.style.flexDirection = 'column';
-  overlay.style.gap = '8px';
+  return Array.from(
+    new Set(days.map((day) => Math.min(6, Math.max(0, Math.round(day))))),
+  ).sort((left, right) => left - right);
+}
 
-  const text = document.createElement('span');
-  text.innerText = `TuyulDM: ${manifestType} Video Detected`;
-  overlay.appendChild(text);
+function toggleScheduleDay(days: number[], day: number) {
+  if (days.includes(day)) {
+    if (days.length === 1) {
+      return days;
+    }
+    return days.filter((value) => value !== day);
+  }
+  return [...days, day].sort((left, right) => left - right);
+}
 
-  const statusText = document.createElement('span');
-  statusText.innerText = 'Inspecting stream variants...';
-  statusText.style.opacity = '0.8';
-  overlay.appendChild(statusText);
+function variantLabel(variant: any) {
+  const parts = [variant?.name, variant?.resolution, variant?.bandwidth ? `${Math.round(Number(variant.bandwidth) / 1000)} kbps` : '']
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+  return parts.join(' · ') || 'Default quality';
+}
+
+function isDrmRefusal(message: string) {
+  const normalized = message.toLowerCase();
+  return normalized.includes('drm') || normalized.includes('encrypted') || normalized.includes('widevine');
+}
+
+function drmPolicyUrl() {
+  const runtime = getRuntime();
+  return runtime?.getURL ? runtime.getURL(DRM_POLICY_HASH) : '#';
+}
+
+function scanPageForVideos(): DetectedManifest[] {
+  const found = new Map<string, DetectedManifest>();
+  const remember = (candidate: unknown) => {
+    const url = String(candidate || '').trim();
+    const manifestType = detectManifestTypeFromUrl(url);
+    if (!url || !manifestType) {
+      return;
+    }
+    found.set(`${manifestType}:${url}`, { url, manifestType });
+  };
+
+  for (const element of document.querySelectorAll('video, source')) {
+    if (element instanceof HTMLMediaElement) {
+      remember(element.currentSrc);
+      remember(element.src);
+      remember(element.getAttribute('src'));
+      continue;
+    }
+
+    if (element instanceof HTMLSourceElement) {
+      remember(element.src);
+      remember(element.getAttribute('src'));
+    }
+  }
+
+  for (const entry of performance.getEntriesByType('resource')) {
+    remember((entry as PerformanceResourceTiming).name);
+  }
+
+  return Array.from(found.values());
+}
+
+function removeOverlayHost() {
+  document.getElementById(OVERLAY_HOST_ID)?.remove();
+}
+
+function createScheduleField(labelText: string, value: number, onChange: (nextValue: number) => void) {
+  const field = document.createElement('label');
+  field.className = 'schedule-field';
+
+  const label = document.createElement('span');
+  label.textContent = labelText;
+  field.appendChild(label);
+
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.min = '0';
+  input.max = '23';
+  input.step = '1';
+  input.value = String(value);
+  input.addEventListener('change', () => {
+    const nextValue = normalizeScheduleHour(Number(input.value));
+    input.value = String(nextValue);
+    onChange(nextValue);
+  });
+  field.appendChild(input);
+  return field;
+}
+
+function injectDetectedManifestOverlay(url: string, manifestType: string, defaultSchedule?: OverlayDownloadSchedule) {
+  removeOverlayHost();
+
+  const host = document.createElement('div');
+  host.id = OVERLAY_HOST_ID;
+  host.style.all = 'initial';
+  host.style.position = 'fixed';
+  host.style.top = '20px';
+  host.style.right = '20px';
+  host.style.zIndex = '2147483647';
+  host.style.pointerEvents = 'auto';
+  host.style.fontFamily = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace';
+  host.style.color = '#E4E3E0';
+
+  const shadowRoot = host.attachShadow({ mode: 'open' });
+  const style = document.createElement('style');
+  style.textContent = `
+    :host { all: initial; }
+    * { box-sizing: border-box; }
+    .card {
+      width: min(360px, calc(100vw - 32px));
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 14px 16px;
+      border-radius: 12px;
+      border: 1px solid rgba(228, 227, 224, 0.12);
+      background: rgba(17, 17, 17, 0.96);
+      color: #E4E3E0;
+      box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+      backdrop-filter: blur(16px);
+    }
+    .eyebrow {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.18em;
+      color: rgba(228, 227, 224, 0.55);
+    }
+    .title {
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.5;
+    }
+    .status {
+      font-size: 12px;
+      line-height: 1.5;
+      color: rgba(228, 227, 224, 0.72);
+    }
+    .error {
+      display: none;
+      gap: 8px;
+      flex-direction: column;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(248, 113, 113, 0.25);
+      background: rgba(127, 29, 29, 0.35);
+      color: #fecaca;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .error a {
+      color: #fff;
+      text-decoration: underline;
+      cursor: pointer;
+    }
+    select, input {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(228, 227, 224, 0.16);
+      background: #090909;
+      color: #E4E3E0;
+      font: inherit;
+    }
+    select {
+      display: none;
+    }
+    .schedule {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(228, 227, 224, 0.12);
+      background: rgba(255, 255, 255, 0.03);
+    }
+    .schedule-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .schedule-copy {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 11px;
+    }
+    .schedule-copy strong {
+      font-size: 12px;
+    }
+    .schedule-copy span {
+      color: rgba(228, 227, 224, 0.66);
+    }
+    .schedule-grid {
+      display: none;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .schedule-field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 11px;
+      color: rgba(228, 227, 224, 0.72);
+    }
+    .days {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
+      gap: 6px;
+    }
+    .day {
+      padding: 6px 0;
+      border-radius: 8px;
+      border: 1px solid rgba(228, 227, 224, 0.16);
+      background: #090909;
+      color: rgba(228, 227, 224, 0.72);
+      font: inherit;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .day.active {
+      border-color: #E4E3E0;
+      background: #E4E3E0;
+      color: #0A0A0A;
+    }
+    .actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    button {
+      font: inherit;
+      cursor: pointer;
+    }
+    .primary {
+      border: none;
+      border-radius: 8px;
+      padding: 8px 12px;
+      background: #E4E3E0;
+      color: #0A0A0A;
+      font-weight: 700;
+    }
+    .ghost {
+      border: 1px solid rgba(228, 227, 224, 0.2);
+      border-radius: 8px;
+      padding: 8px 12px;
+      background: transparent;
+      color: #E4E3E0;
+    }
+    .primary:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+  `;
+  shadowRoot.appendChild(style);
+
+  const card = document.createElement('div');
+  card.className = 'card';
+
+  const eyebrow = document.createElement('div');
+  eyebrow.className = 'eyebrow';
+  eyebrow.textContent = 'TuyulDM Video Grabber';
+  card.appendChild(eyebrow);
+
+  const title = document.createElement('div');
+  title.className = 'title';
+  title.textContent = `${manifestType} stream detected`;
+  card.appendChild(title);
+
+  const statusText = document.createElement('div');
+  statusText.className = 'status';
+  statusText.textContent = 'Inspecting stream variants...';
+  card.appendChild(statusText);
+
+  const errorCard = document.createElement('div');
+  errorCard.className = 'error';
+  const errorText = document.createElement('div');
+  const whyLink = document.createElement('a');
+  whyLink.href = drmPolicyUrl();
+  whyLink.target = '_blank';
+  whyLink.rel = 'noopener noreferrer';
+  whyLink.textContent = 'Why?';
+  errorCard.appendChild(errorText);
+  errorCard.appendChild(whyLink);
+  card.appendChild(errorCard);
 
   const variantSelect = document.createElement('select');
-  variantSelect.style.backgroundColor = '#0E0E0E';
-  variantSelect.style.color = '#E4E3E0';
-  variantSelect.style.border = '1px solid rgba(228, 227, 224, 0.2)';
-  variantSelect.style.padding = '6px 10px';
-  variantSelect.style.borderRadius = '4px';
-  variantSelect.style.fontFamily = 'monospace';
-  variantSelect.style.fontSize = '12px';
-  variantSelect.style.display = 'none';
-  overlay.appendChild(variantSelect);
+  card.appendChild(variantSelect);
 
-  const buttonRow = document.createElement('div');
-  buttonRow.style.display = 'flex';
-  buttonRow.style.gap = '8px';
-
-  const downloadButton = document.createElement('button');
-  downloadButton.innerText = 'Download Video';
-  downloadButton.style.backgroundColor = '#E4E3E0';
-  downloadButton.style.color = '#141414';
-  downloadButton.style.border = 'none';
-  downloadButton.style.padding = '6px 12px';
-  downloadButton.style.borderRadius = '4px';
-  downloadButton.style.cursor = 'pointer';
-  downloadButton.style.fontWeight = 'bold';
   let selectedVariantId = '';
   let scheduleEnabled = !!defaultSchedule;
   let scheduleStartHour = normalizeScheduleHour(defaultSchedule?.start_hour ?? 2);
@@ -140,147 +407,91 @@ export function injectDetectedManifestOverlay(url: string, manifestType: string,
     };
   }
 
-  function variantLabel(variant: any) {
-    const parts = [variant?.name, variant?.resolution, variant?.bandwidth ? `${Math.round(Number(variant.bandwidth) / 1000)} kbps` : '']
-      .map((value) => String(value || '').trim())
-      .filter(Boolean);
-    return parts.join(' · ') || 'Default quality';
-  }
-
   const scheduleCard = document.createElement('div');
-  scheduleCard.style.display = 'flex';
-  scheduleCard.style.flexDirection = 'column';
-  scheduleCard.style.gap = '8px';
-  scheduleCard.style.padding = '8px 10px';
-  scheduleCard.style.border = '1px solid rgba(228, 227, 224, 0.12)';
-  scheduleCard.style.borderRadius = '6px';
-  scheduleCard.style.backgroundColor = '#101010';
+  scheduleCard.className = 'schedule';
 
   const scheduleHeader = document.createElement('div');
-  scheduleHeader.style.display = 'flex';
-  scheduleHeader.style.alignItems = 'center';
-  scheduleHeader.style.justifyContent = 'space-between';
-  scheduleHeader.style.gap = '12px';
+  scheduleHeader.className = 'schedule-head';
 
-  const scheduleHeaderCopy = document.createElement('div');
-  scheduleHeaderCopy.style.display = 'flex';
-  scheduleHeaderCopy.style.flexDirection = 'column';
-  scheduleHeaderCopy.style.gap = '4px';
-
-  const scheduleLabel = document.createElement('span');
-  scheduleLabel.innerText = 'Schedule';
-  scheduleLabel.style.fontWeight = 'bold';
-  scheduleHeaderCopy.appendChild(scheduleLabel);
-
+  const scheduleCopy = document.createElement('div');
+  scheduleCopy.className = 'schedule-copy';
+  const scheduleLabel = document.createElement('strong');
+  scheduleLabel.textContent = 'Schedule';
+  scheduleCopy.appendChild(scheduleLabel);
   const scheduleHint = document.createElement('span');
-  scheduleHint.innerText = 'Applies only to this video download.';
-  scheduleHint.style.opacity = '0.7';
-  scheduleHint.style.fontSize = '11px';
-  scheduleHeaderCopy.appendChild(scheduleHint);
+  scheduleHint.textContent = 'Applies only to this video download.';
+  scheduleCopy.appendChild(scheduleHint);
+  scheduleHeader.appendChild(scheduleCopy);
 
   const scheduleToggle = document.createElement('input');
   scheduleToggle.type = 'checkbox';
   scheduleToggle.checked = scheduleEnabled;
+  scheduleToggle.style.width = '18px';
+  scheduleToggle.style.height = '18px';
   scheduleToggle.style.margin = '0';
-
-  scheduleHeader.appendChild(scheduleHeaderCopy);
   scheduleHeader.appendChild(scheduleToggle);
   scheduleCard.appendChild(scheduleHeader);
 
   const scheduleFields = document.createElement('div');
+  scheduleFields.className = 'schedule-grid';
   scheduleFields.style.display = scheduleEnabled ? 'grid' : 'none';
-  scheduleFields.style.gridTemplateColumns = 'repeat(2, minmax(0, 1fr))';
-  scheduleFields.style.gap = '8px';
-
-  function buildScheduleField(labelText: string, value: number, onChange: (nextValue: number) => void) {
-    const field = document.createElement('label');
-    field.style.display = 'flex';
-    field.style.flexDirection = 'column';
-    field.style.gap = '4px';
-
-    const label = document.createElement('span');
-    label.innerText = labelText;
-    label.style.opacity = '0.75';
-    label.style.fontSize = '11px';
-    field.appendChild(label);
-
-    const input = document.createElement('input');
-    input.type = 'number';
-    input.min = '0';
-    input.max = '23';
-    input.step = '1';
-    input.value = String(value);
-    input.style.backgroundColor = '#0A0A0A';
-    input.style.color = '#E4E3E0';
-    input.style.border = '1px solid rgba(228, 227, 224, 0.2)';
-    input.style.padding = '6px 8px';
-    input.style.borderRadius = '4px';
-    input.style.fontFamily = 'monospace';
-    input.style.fontSize = '12px';
-    input.onchange = () => {
-      const nextValue = normalizeScheduleHour(Number(input.value));
-      input.value = String(nextValue);
-      onChange(nextValue);
-    };
-    field.appendChild(input);
-
-    return field;
-  }
-
-  scheduleFields.appendChild(buildScheduleField('Start Hour', scheduleStartHour, (nextValue) => {
+  scheduleFields.appendChild(createScheduleField('Start Hour', scheduleStartHour, (nextValue) => {
     scheduleStartHour = nextValue;
   }));
-  scheduleFields.appendChild(buildScheduleField('End Hour', scheduleEndHour, (nextValue) => {
+  scheduleFields.appendChild(createScheduleField('End Hour', scheduleEndHour, (nextValue) => {
     scheduleEndHour = nextValue;
   }));
 
   const dayPicker = document.createElement('div');
-  dayPicker.style.display = 'grid';
-  dayPicker.style.gridTemplateColumns = 'repeat(7, minmax(0, 1fr))';
-  dayPicker.style.gap = '6px';
-  dayPicker.style.gridColumn = '1 / -1';
-
+  dayPicker.className = 'days';
   const dayButtons = new Map<number, HTMLButtonElement>();
-  function syncDayButtons() {
+  const syncDayButtons = () => {
     for (const [day, button] of dayButtons.entries()) {
-      const active = scheduleDays.includes(day);
-      button.style.backgroundColor = active ? '#E4E3E0' : '#0A0A0A';
-      button.style.color = active ? '#141414' : '#E4E3E0';
-      button.style.borderColor = active ? '#E4E3E0' : 'rgba(228, 227, 224, 0.2)';
+      button.className = scheduleDays.includes(day) ? 'day active' : 'day';
     }
-  }
+  };
 
-  for (const option of weekdayOptions) {
+  for (const option of WEEKDAY_OPTIONS) {
     const button = document.createElement('button');
     button.type = 'button';
-    button.innerText = option.label;
-    button.style.padding = '6px 0';
-    button.style.borderRadius = '4px';
-    button.style.border = '1px solid rgba(228, 227, 224, 0.2)';
-    button.style.cursor = 'pointer';
-    button.style.fontFamily = 'monospace';
-    button.style.fontSize = '11px';
-    button.onclick = () => {
+    button.textContent = option.label;
+    button.className = 'day';
+    button.addEventListener('click', () => {
       scheduleDays = toggleScheduleDay(scheduleDays, option.value);
       syncDayButtons();
-    };
+    });
     dayButtons.set(option.value, button);
     dayPicker.appendChild(button);
   }
   syncDayButtons();
-
   scheduleFields.appendChild(dayPicker);
   scheduleCard.appendChild(scheduleFields);
-  overlay.appendChild(scheduleCard);
+  card.appendChild(scheduleCard);
 
-  scheduleToggle.onchange = () => {
+  scheduleToggle.addEventListener('change', () => {
     scheduleEnabled = scheduleToggle.checked;
     scheduleFields.style.display = scheduleEnabled ? 'grid' : 'none';
-  };
+  });
 
-  downloadButton.onclick = () => {
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+
+  const dismissButton = document.createElement('button');
+  dismissButton.type = 'button';
+  dismissButton.className = 'ghost';
+  dismissButton.textContent = 'Dismiss';
+
+  const downloadButton = document.createElement('button');
+  downloadButton.type = 'button';
+  downloadButton.className = 'primary';
+  downloadButton.textContent = 'Download Video';
+
+  const closeOverlay = () => removeOverlayHost();
+  dismissButton.addEventListener('click', closeOverlay);
+  actions.appendChild(dismissButton);
+
+  downloadButton.addEventListener('click', () => {
     downloadButton.disabled = true;
-    downloadButton.style.opacity = '0.5';
     void sendRuntimeMessage({
       type: 'START_VIDEO_DOWNLOAD',
       url,
@@ -288,38 +499,27 @@ export function injectDetectedManifestOverlay(url: string, manifestType: string,
       selectedVariantId,
       schedule: currentSchedule(),
     }).then(() => {
-      overlay.remove();
+      closeOverlay();
     }).catch((error) => {
-      statusText.innerText = `Failed to start download: ${error instanceof Error ? error.message : String(error)}`;
+      statusText.textContent = `Failed to start download: ${error instanceof Error ? error.message : String(error)}`;
       downloadButton.disabled = false;
-      downloadButton.style.opacity = '1';
     });
-  };
-  buttonRow.appendChild(downloadButton);
+  });
+  actions.appendChild(downloadButton);
+  card.appendChild(actions);
 
-  const dismissButton = document.createElement('button');
-  dismissButton.innerText = 'Dismiss';
-  dismissButton.style.backgroundColor = 'transparent';
-  dismissButton.style.color = '#E4E3E0';
-  dismissButton.style.border = '1px solid #E4E3E0';
-  dismissButton.style.padding = '6px 12px';
-  dismissButton.style.borderRadius = '4px';
-  dismissButton.style.cursor = 'pointer';
-  dismissButton.onclick = () => {
-    overlay.remove();
-  };
-  buttonRow.appendChild(dismissButton);
-
-  overlay.appendChild(buttonRow);
-  document.body.appendChild(overlay);
+  shadowRoot.appendChild(card);
+  document.documentElement.appendChild(host);
 
   void sendRuntimeMessage({ type: 'INSPECT_VIDEO_MANIFEST', url, manifestType })
     .then((response: any) => {
       if (response?.error) {
-        statusText.innerText = response.error;
+        statusText.textContent = response.error;
         downloadButton.disabled = true;
-        downloadButton.style.opacity = '0.5';
-        downloadButton.style.cursor = 'not-allowed';
+        if (isDrmRefusal(String(response.error))) {
+          errorText.textContent = response.error;
+          errorCard.style.display = 'flex';
+        }
         return;
       }
 
@@ -330,7 +530,7 @@ export function injectDetectedManifestOverlay(url: string, manifestType: string,
         if (!selectedVariantId && variants[0]?.id) {
           selectedVariantId = variants[0].id;
         }
-        statusText.innerText = variants[0] ? `Quality: ${variantLabel(variants[0])}` : 'Using detected stream quality';
+        statusText.textContent = variants[0] ? `Quality: ${variantLabel(variants[0])}` : 'Using detected stream quality';
         return;
       }
 
@@ -349,19 +549,53 @@ export function injectDetectedManifestOverlay(url: string, manifestType: string,
         variantSelect.value = selectedVariantId;
       }
 
-      variantSelect.onchange = () => {
+      variantSelect.addEventListener('change', () => {
         selectedVariantId = variantSelect.value;
-      };
+      });
       variantSelect.style.display = 'block';
-      statusText.innerText = 'Choose a quality before starting the download.';
+      statusText.textContent = 'Choose a quality before starting the download.';
     })
     .catch((error) => {
-      statusText.innerText = `Manifest inspection failed: ${error instanceof Error ? error.message : String(error)}`;
+      statusText.textContent = `Manifest inspection failed: ${error instanceof Error ? error.message : String(error)}`;
     });
 
   window.setTimeout(() => {
-    if (overlay.isConnected) {
-      overlay.remove();
+    if (host.isConnected) {
+      closeOverlay();
     }
-  }, 30_000);
+  }, OVERLAY_AUTO_DISMISS_MS);
 }
+
+function installMessageListener() {
+  const runtime = getRuntime();
+  if (!runtime?.onMessage) {
+    return;
+  }
+
+  runtime.onMessage.addListener((message: any, _sender: any, sendResponse: (response?: any) => void) => {
+    if (message?.type === 'PING_TUYULDM_CONTENT') {
+      sendResponse({ ok: true });
+      return false;
+    }
+
+    if (message?.type === 'SHOW_VIDEO_OVERLAY') {
+      injectDetectedManifestOverlay(String(message.url || ''), String(message.manifestType || ''), message.schedule);
+      sendResponse({ ok: true });
+      return false;
+    }
+
+    if (message?.type === 'SCAN_PAGE_VIDEOS') {
+      sendResponse({ streams: scanPageForVideos() });
+      return false;
+    }
+
+    return false;
+  });
+}
+
+if (!window.__TUYULDM_CONTENT_READY__) {
+  window.__TUYULDM_CONTENT_READY__ = true;
+  installMessageListener();
+}
+
+export {};

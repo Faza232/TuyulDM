@@ -1,5 +1,4 @@
 import browser from 'webextension-polyfill';
-import { injectDetectedManifestOverlay } from '../content/index';
 
 const browserApi = browser as any;
 const HOST_NAME = 'com.tuyuldm.daemon';
@@ -14,6 +13,7 @@ const DEFAULT_INTERCEPTION_SETTINGS = Object.freeze({
   minFileSizeMB: 50,
   allowDomains: [],
   blockDomains: [],
+  autoShowDetectedStreams: false,
   scheduleEnabled: false,
   scheduleStartHour: 2,
   scheduleEndHour: 6,
@@ -25,12 +25,27 @@ const FORWARDED_HEADERS = new Map([
   ['referer', 'Referer'],
   ['user-agent', 'User-Agent'],
 ]);
+const DETECTED_STREAM_TTL_MS = 5 * 60_000;
+
+type OverlayDownloadSchedule = {
+  start_hour: number;
+  end_hour: number;
+  days: number[];
+};
+
+type DetectedStreamEntry = {
+  url: string;
+  manifestType: 'HLS' | 'DASH';
+  detectedAt: number;
+  source: 'network' | 'page';
+};
 
 let port: any | null = null;
 let progressInterval: ReturnType<typeof setInterval> | null = null;
 const activeDownloads = new Set<string>();
 const recentRequestHeaders = new Map<string, { headers: Record<string, string>; expiresAt: number }>();
 const pendingRequests = new Map<number, { resolve: (response: any) => void; reject: (error: Error) => void }>();
+const detectedStreamsByTab = new Map<number, DetectedStreamEntry[]>();
 let nextRequestId = 10_000;
 let hostStatus = {
   connected: false,
@@ -47,6 +62,152 @@ function broadcastRuntimeMessage(message: Record<string, unknown>) {
 function updateHostStatus(nextStatus: Partial<typeof hostStatus>) {
   hostStatus = { ...hostStatus, ...nextStatus };
   broadcastRuntimeMessage({ type: 'HOST_STATUS', payload: hostStatus });
+}
+
+function normalizeManifestType(value: unknown): DetectedStreamEntry['manifestType'] | '' {
+  const normalized = String(value || '').trim().toUpperCase();
+  if (normalized === 'HLS' || normalized === 'DASH') {
+    return normalized;
+  }
+  return '';
+}
+
+function getContentScriptFiles() {
+  const manifest = browserApi.runtime.getManifest();
+  const scripts = manifest.content_scripts?.[0]?.js;
+  return Array.isArray(scripts) ? scripts : [];
+}
+
+function pruneDetectedStreams(tabId?: number) {
+  const now = Date.now();
+  const pruneEntries = (entries: DetectedStreamEntry[]) => entries.filter((entry) => entry.detectedAt + DETECTED_STREAM_TTL_MS > now);
+
+  if (typeof tabId === 'number') {
+    const entries = pruneEntries(detectedStreamsByTab.get(tabId) ?? []);
+    if (entries.length > 0) {
+      detectedStreamsByTab.set(tabId, entries);
+    } else {
+      detectedStreamsByTab.delete(tabId);
+    }
+    return;
+  }
+
+  for (const currentTabId of detectedStreamsByTab.keys()) {
+    pruneDetectedStreams(currentTabId);
+  }
+}
+
+function getDetectedStreams(tabId: number) {
+  pruneDetectedStreams(tabId);
+  return [...(detectedStreamsByTab.get(tabId) ?? [])].sort((left, right) => right.detectedAt - left.detectedAt);
+}
+
+function rememberDetectedStream(tabId: number, entry: Omit<DetectedStreamEntry, 'detectedAt'>) {
+  const manifestType = normalizeManifestType(entry.manifestType);
+  if (!manifestType || !entry.url) {
+    return { isNew: false };
+  }
+
+  const entries = getDetectedStreams(tabId);
+  const existingEntry = entries.find((candidate) => candidate.url === entry.url && candidate.manifestType === manifestType);
+  if (existingEntry) {
+    existingEntry.detectedAt = Date.now();
+    existingEntry.source = entry.source;
+  } else {
+    entries.unshift({ ...entry, manifestType, detectedAt: Date.now() });
+  }
+  detectedStreamsByTab.set(tabId, entries.slice(0, 24));
+  broadcastRuntimeMessage({ type: 'DETECTED_STREAMS_UPDATED', payload: { tabId, count: entries.length } });
+  return { isNew: !existingEntry };
+}
+
+async function getActiveTab() {
+  const tabs = await browserApi.tabs.query({ active: true, currentWindow: true });
+  return tabs[0] ?? null;
+}
+
+async function ensureContentScript(tabId: number) {
+  try {
+    await browserApi.tabs.sendMessage(tabId, { type: 'PING_TUYULDM_CONTENT' });
+    return true;
+  } catch {
+    const files = getContentScriptFiles();
+    if (files.length === 0) {
+      return false;
+    }
+
+    try {
+      await browserApi.scripting.executeScript({
+        target: { tabId },
+        files,
+      });
+      await browserApi.tabs.sendMessage(tabId, { type: 'PING_TUYULDM_CONTENT' });
+      return true;
+    } catch (error) {
+      console.warn('Failed to ensure content script:', error);
+      return false;
+    }
+  }
+}
+
+async function sendMessageToTab(tabId: number, message: Record<string, unknown>) {
+  const ready = await ensureContentScript(tabId);
+  if (!ready) {
+    return null;
+  }
+
+  return browserApi.tabs.sendMessage(tabId, message);
+}
+
+async function showDetectedStreamOverlay(tabId: number, url: string, manifestType: string, schedule?: OverlayDownloadSchedule) {
+  try {
+    await sendMessageToTab(tabId, {
+      type: 'SHOW_VIDEO_OVERLAY',
+      url,
+      manifestType,
+      schedule,
+    });
+  } catch (error) {
+    console.warn('Failed to show video overlay:', error);
+  }
+}
+
+async function scanTabForVideos(tabId: number) {
+  try {
+    const response = await sendMessageToTab(tabId, { type: 'SCAN_PAGE_VIDEOS' });
+    return Array.isArray((response as any)?.streams) ? (response as any).streams : [];
+  } catch (error) {
+    console.warn('Failed to scan tab for videos:', error);
+    return [];
+  }
+}
+
+async function recordDetectedStream(tabId: number, url: string, manifestType: string, source: DetectedStreamEntry['source']) {
+  const normalizedType = normalizeManifestType(manifestType);
+  if (!normalizedType) {
+    return;
+  }
+
+  const { isNew } = rememberDetectedStream(tabId, { url, manifestType: normalizedType, source });
+  if (!isNew) {
+    return;
+  }
+
+  try {
+    const settings = await getInterceptionSettings();
+    const schedule = buildInterceptionSchedule(settings);
+    if (settings.autoShowDetectedStreams) {
+      await showDetectedStreamOverlay(tabId, url, normalizedType, schedule);
+    }
+  } catch (error) {
+    console.warn('Failed to process detected stream:', error);
+  }
+}
+
+async function refreshDetectedStreamsFromPage(tabId: number) {
+  const results = await scanTabForVideos(tabId);
+  await Promise.all(results.map((entry: any) => recordDetectedStream(tabId, String(entry?.url || ''), String(entry?.manifestType || ''), 'page')));
+  return getDetectedStreams(tabId);
 }
 
 function normalizeList(value: unknown) {
@@ -110,6 +271,9 @@ function normalizeInterceptionSettings(raw: Record<string, unknown> = {}) {
     minFileSizeMB,
     allowDomains: uniqueStrings(normalizeList(raw.allowDomains).map(normalizeDomain)),
     blockDomains: uniqueStrings(normalizeList(raw.blockDomains).map(normalizeDomain)),
+    autoShowDetectedStreams: typeof raw.autoShowDetectedStreams === 'boolean'
+      ? raw.autoShowDetectedStreams
+      : DEFAULT_INTERCEPTION_SETTINGS.autoShowDetectedStreams,
     scheduleEnabled: typeof raw.scheduleEnabled === 'boolean' ? raw.scheduleEnabled : DEFAULT_INTERCEPTION_SETTINGS.scheduleEnabled,
     scheduleStartHour: normalizeScheduleHour(raw.scheduleStartHour ?? DEFAULT_INTERCEPTION_SETTINGS.scheduleStartHour),
     scheduleEndHour: normalizeScheduleHour(raw.scheduleEndHour ?? DEFAULT_INTERCEPTION_SETTINGS.scheduleEndHour),
@@ -475,6 +639,10 @@ async function interceptDownload(item: any) {
 
 connectToHost();
 
+browserApi.tabs.onRemoved.addListener((tabId: number) => {
+  detectedStreamsByTab.delete(tabId);
+});
+
 browserApi.webRequest.onSendHeaders.addListener(
   (details: any) => {
     captureRequestHeaders(details);
@@ -515,26 +683,29 @@ browserApi.webRequest.onHeadersReceived.addListener(
     }
 
     if (isManifest && details.tabId >= 0) {
-      void getInterceptionSettings()
-        .then((settings) => buildInterceptionSchedule(settings))
-        .catch((error) => {
-          console.warn('Failed to load interception schedule for overlay:', error);
-          return undefined;
-        })
-        .then((schedule) => {
-          browserApi.scripting.executeScript({
-            target: { tabId: details.tabId },
-            func: injectDetectedManifestOverlay,
-            args: [url, manifestType, schedule],
-          }).catch((error: unknown) => {
-            console.error('Failed to inject overlay:', error);
-          });
-        });
+      void recordDetectedStream(details.tabId, url, manifestType, 'network');
     }
   },
-  { urls: ['<all_urls>'], types: ['xmlhttprequest', 'other'] },
+  { urls: ['<all_urls>'], types: ['xmlhttprequest', 'media', 'other', 'sub_frame', 'object', 'main_frame'] },
   ['responseHeaders'],
 );
+
+browserApi.webNavigation.onCompleted.addListener((details: any) => {
+  if (details.frameId !== 0 || details.tabId < 0) {
+    return;
+  }
+
+  void getActiveTab()
+    .then((tab) => {
+      if (!tab?.id || tab.id !== details.tabId) {
+        return;
+      }
+      return refreshDetectedStreamsFromPage(details.tabId);
+    })
+    .catch((error: unknown) => {
+      console.warn('Active-tab manifest scan failed:', error);
+    });
+});
 
 browserApi.runtime.onMessage.addListener(((message: any, _sender: any, sendResponse: (response?: any) => void) => {
   if (message.type === 'INSPECT_VIDEO_MANIFEST') {
@@ -554,6 +725,43 @@ browserApi.runtime.onMessage.addListener(((message: any, _sender: any, sendRespo
   if (message.type === 'GET_INTERCEPTION_SETTINGS') {
     getInterceptionSettings()
       .then((settings) => sendResponse({ settings }))
+      .catch((error) => sendResponse({ error: String(error) }));
+    return true;
+  }
+
+  if (message.type === 'GET_DETECTED_STREAMS') {
+    getActiveTab()
+      .then((tab) => sendResponse({ streams: tab?.id != null ? getDetectedStreams(tab.id) : [] }))
+      .catch((error) => sendResponse({ error: String(error), streams: [] }));
+    return true;
+  }
+
+  if (message.type === 'SCAN_PAGE_VIDEOS') {
+    getActiveTab()
+      .then(async (tab) => {
+        if (!tab?.id) {
+          return { streams: [] };
+        }
+        const streams = await refreshDetectedStreamsFromPage(tab.id);
+        return { streams };
+      })
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ error: String(error), streams: [] }));
+    return true;
+  }
+
+  if (message.type === 'SHOW_DETECTED_STREAM_OVERLAY') {
+    getActiveTab()
+      .then(async (tab) => {
+        if (!tab?.id) {
+          return { error: 'Active tab unavailable' };
+        }
+
+        const settings = await getInterceptionSettings();
+        await showDetectedStreamOverlay(tab.id, String(message.url || ''), String(message.manifestType || ''), buildInterceptionSchedule(settings));
+        return { ok: true };
+      })
+      .then((result) => sendResponse(result))
       .catch((error) => sendResponse({ error: String(error) }));
     return true;
   }

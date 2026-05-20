@@ -51,10 +51,18 @@ interface InterceptionSettings {
   minFileSizeMB: number;
   allowDomains: string[];
   blockDomains: string[];
+  autoShowDetectedStreams: boolean;
   scheduleEnabled: boolean;
   scheduleStartHour: number;
   scheduleEndHour: number;
   scheduleDays: number[];
+}
+
+interface DetectedStreamItem {
+  url: string;
+  manifestType: string;
+  detectedAt?: number;
+  source?: string;
 }
 
 interface HostStatus {
@@ -89,6 +97,7 @@ const DEFAULT_INTERCEPTION_SETTINGS: InterceptionSettings = {
   minFileSizeMB: 50,
   allowDomains: [],
   blockDomains: [],
+  autoShowDetectedStreams: false,
   scheduleEnabled: false,
   scheduleStartHour: 2,
   scheduleEndHour: 6,
@@ -217,6 +226,9 @@ function normalizeInterceptionSettings(settings: Partial<InterceptionSettings>):
     minFileSizeMB,
     allowDomains: uniqueStrings((settings.allowDomains ?? DEFAULT_INTERCEPTION_SETTINGS.allowDomains).map(normalizeDomainRule)),
     blockDomains: uniqueStrings((settings.blockDomains ?? DEFAULT_INTERCEPTION_SETTINGS.blockDomains).map(normalizeDomainRule)),
+    autoShowDetectedStreams: typeof settings.autoShowDetectedStreams === 'boolean'
+      ? settings.autoShowDetectedStreams
+      : DEFAULT_INTERCEPTION_SETTINGS.autoShowDetectedStreams,
     scheduleEnabled: typeof settings.scheduleEnabled === 'boolean' ? settings.scheduleEnabled : DEFAULT_INTERCEPTION_SETTINGS.scheduleEnabled,
     scheduleStartHour: normalizeScheduleHour(Number(settings.scheduleStartHour ?? DEFAULT_INTERCEPTION_SETTINGS.scheduleStartHour)),
     scheduleEndHour: normalizeScheduleHour(Number(settings.scheduleEndHour ?? DEFAULT_INTERCEPTION_SETTINGS.scheduleEndHour)),
@@ -332,6 +344,18 @@ function formatAttemptTimestamp(value: string | undefined) {
   return timestamp.toLocaleString();
 }
 
+function formatDetectedTimestamp(value: number | undefined) {
+  if (!Number.isFinite(value) || !value) {
+    return 'just now';
+  }
+
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) {
+    return 'just now';
+  }
+  return timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
 function getDownloadParentDirectory(outputPath: string | undefined) {
   if (!outputPath) {
     return '';
@@ -363,6 +387,10 @@ export default function App({ surface = 'dashboard' }: AppProps) {
   const [hostStatus, setHostStatus] = useState<HostStatus>(DEFAULT_HOST_STATUS);
   const [hostStats, setHostStats] = useState<HostStats>(DEFAULT_HOST_STATS);
   const [hostSettings, setHostSettings] = useState<HostSettings>(DEFAULT_HOST_SETTINGS);
+  const [detectedStreams, setDetectedStreams] = useState<DetectedStreamItem[]>([]);
+  const [grabberNotice, setGrabberNotice] = useState<string | null>(null);
+  const [isScanningPage, setIsScanningPage] = useState(false);
+  const [grabberBusyUrl, setGrabberBusyUrl] = useState<string | null>(null);
   const [downloadDirInput, setDownloadDirInput] = useState(DEFAULT_HOST_SETTINGS.downloadDir);
   const [downloadDirError, setDownloadDirError] = useState<string | null>(null);
   // TODO: extend single-item removal flow to multi-select actions.
@@ -524,6 +552,23 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     setDownloads(previewDownloads);
   };
 
+  const refreshDetectedStreams = async () => {
+    if (!isExtensionRuntimeAvailable()) {
+      setDetectedStreams([]);
+      setGrabberNotice('Detected streams require extension runtime. Open popup in browser.');
+      return;
+    }
+
+    const response = await sendExtensionMessage<{ streams?: DetectedStreamItem[]; error?: string }>({ type: 'GET_DETECTED_STREAMS' });
+    if (response?.error) {
+      setGrabberNotice(response.error);
+      return;
+    }
+
+    setDetectedStreams(Array.isArray(response?.streams) ? response.streams : []);
+    setGrabberNotice(null);
+  };
+
   const buildDownloadSchedule = (): DownloadSchedulePayload | undefined => {
     if (!scheduleEnabled) {
       return undefined;
@@ -578,6 +623,8 @@ export default function App({ surface = 'dashboard' }: AppProps) {
           applyHostSettings(message.payload || {});
         } else if (message.type === 'HOST_STATUS') {
           setHostStatus(normalizeHostStatus(message.payload));
+        } else if (message.type === 'DETECTED_STREAMS_UPDATED') {
+          void refreshDetectedStreams();
         }
       };
 
@@ -585,6 +632,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
       void refreshDownloads();
       void refreshHostStatus();
       void refreshHostStats();
+      void refreshDetectedStreams();
 
       const interval = window.setInterval(() => {
         void refreshHostStats();
@@ -788,6 +836,69 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     await fetch(`/api/downloads/${id}/reveal`, { method: 'POST' });
   };
 
+  const startVideoDownload = async (stream: DetectedStreamItem) => {
+    if (!isExtensionRuntimeAvailable()) {
+      setGrabberNotice('Video grabber requires extension runtime.');
+      return;
+    }
+
+    setGrabberBusyUrl(stream.url);
+    setGrabberNotice(null);
+    try {
+      await sendExtensionMessage({
+        type: 'START_VIDEO_DOWNLOAD',
+        url: stream.url,
+        manifestType: stream.manifestType,
+      });
+      setGrabberNotice(`Queued ${stream.manifestType} download.`);
+      void refreshDownloads();
+      void refreshHostStats();
+    } catch (error) {
+      setGrabberNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setGrabberBusyUrl(null);
+    }
+  };
+
+  const reviewDetectedStream = async (stream: DetectedStreamItem) => {
+    if (!isExtensionRuntimeAvailable()) {
+      setGrabberNotice('Overlay review requires extension runtime.');
+      return;
+    }
+
+    const response = await sendExtensionMessage<{ error?: string }>({
+      type: 'SHOW_DETECTED_STREAM_OVERLAY',
+      url: stream.url,
+      manifestType: stream.manifestType,
+    });
+    if (response?.error) {
+      setGrabberNotice(response.error);
+      return;
+    }
+    setGrabberNotice('Overlay sent to active tab.');
+  };
+
+  const scanPageForVideos = async () => {
+    if (!isExtensionRuntimeAvailable()) {
+      setGrabberNotice('Scan works only inside extension popup.');
+      return;
+    }
+
+    setIsScanningPage(true);
+    setGrabberNotice(null);
+    const response = await sendExtensionMessage<{ streams?: DetectedStreamItem[]; error?: string }>({ type: 'SCAN_PAGE_VIDEOS' });
+    setIsScanningPage(false);
+
+    if (response?.error) {
+      setGrabberNotice(response.error);
+      return;
+    }
+
+    const streams = Array.isArray(response?.streams) ? response.streams : [];
+    setDetectedStreams(streams);
+    setGrabberNotice(streams.length > 0 ? null : 'No manifest URLs found on current page.');
+  };
+
   const copyPathToClipboard = async (value: string | undefined) => {
     if (!value) {
       return;
@@ -986,6 +1097,29 @@ export default function App({ surface = 'dashboard' }: AppProps) {
           </label>
         </div>
 
+        <div className="flex items-start justify-between gap-4 rounded-2xl border border-white/10 bg-white/2 p-4">
+          <div>
+            <label className="text-[13px] font-medium tracking-wide text-white/90">Auto-Show Detected Streams</label>
+            <p className="text-[10px] uppercase font-mono mt-1 tracking-wider text-white/40">Open overlay on detected manifests instead of waiting for the popup grabber tab</p>
+          </div>
+          <label className="inline-flex items-center cursor-pointer">
+            <input
+              type="checkbox"
+              checked={interceptionSettings.autoShowDetectedStreams}
+              onChange={(event) => {
+                void persistInterceptionSettings({
+                  ...interceptionSettings,
+                  autoShowDetectedStreams: event.target.checked,
+                });
+              }}
+              className="sr-only peer"
+            />
+            <span className="relative h-6 w-11 rounded-full bg-white/10 transition-colors peer-checked:bg-white/80">
+              <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-black transition-transform ${interceptionSettings.autoShowDetectedStreams ? 'translate-x-5' : 'translate-x-0.5'}`} />
+            </span>
+          </label>
+        </div>
+
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-2 sm:col-span-2">
             <label className="text-[13px] font-medium tracking-wide text-white/90">Intercept File Extensions</label>
@@ -1031,6 +1165,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
               <p>Allowed origins: {interceptionSettings.allowDomains.length > 0 ? interceptionSettings.allowDomains.length : 'all matching domains'}</p>
               <p>Blocked domains: {interceptionSettings.blockDomains.length}</p>
               <p>Extensions: {interceptionSettings.extensions.length}</p>
+              <p>Overlay: {interceptionSettings.autoShowDetectedStreams ? 'auto-show' : 'popup only'}</p>
               <p>Auto schedule: {formatScheduleSummary(
                 interceptionSettings.scheduleEnabled,
                 interceptionSettings.scheduleStartHour,
@@ -1236,36 +1371,50 @@ export default function App({ surface = 'dashboard' }: AppProps) {
               <div className="space-y-6">{settingsSections}</div>
             </section>
 
-            <aside className="rounded-3xl border border-white/10 bg-white/[0.02] p-6 backdrop-blur-xl space-y-4">
-              <div>
-                <p className="text-[10px] uppercase tracking-widest font-mono text-white/40">Queue Snapshot</p>
-                <div className="mt-4 space-y-3 text-sm text-white/70">
-                  <div className="flex items-center justify-between">
-                    <span>Downloads tracked</span>
-                    <span className="font-mono text-white/90">{downloads.length}</span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span>Active downloads</span>
-                    <span className="font-mono text-white/90">{hostStats.activeDownloads}</span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span>Queue cap</span>
-                    <span className="font-mono text-white/90">{hostSettings.maxConcurrentDownloads}</span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span>Segments per file</span>
-                    <span className="font-mono text-white/90">x{segmentsCount}</span>
-                  </div>
-                </div>
+            <aside className="space-y-6">
+              <div id="drm-policy" className="rounded-3xl border border-red-500/20 bg-red-500/5 p-6 backdrop-blur-xl">
+                <p className="text-[10px] uppercase tracking-widest font-mono text-red-200/70">DRM Policy</p>
+                <h3 className="mt-3 text-lg font-semibold text-white">Protected streams are refused</h3>
+                <p className="mt-3 text-sm leading-6 text-white/70">
+                  TuyulDM downloads clear HLS and DASH manifests only. If a manifest advertises SAMPLE-AES, AES-128, Widevine, or other DRM signaling,
+                  the host refuses it and no key retrieval path is attempted.
+                </p>
+                <p className="mt-3 text-sm leading-6 text-white/55">
+                  Reason: no key handling, no license exchange, no Widevine path. Refusal is intentional and should appear in the overlay as a red error banner.
+                </p>
               </div>
 
-              <div className="rounded-2xl border border-white/10 bg-[#121212] p-4 text-sm text-white/60">
-                <p className="font-medium text-white/85">Native host state</p>
-                <p className="mt-2 leading-6">
-                  {hostStatus.connected
-                    ? 'The popup and options page are reading live state from the native host.'
-                    : hostStatus.lastError || 'The native host is unavailable. The extension UI will stay usable, but downloads will not start until the host reconnects.'}
-                </p>
+              <div className="rounded-3xl border border-white/10 bg-white/2 p-6 backdrop-blur-xl space-y-4">
+                <div>
+                  <p className="text-[10px] uppercase tracking-widest font-mono text-white/40">Queue Snapshot</p>
+                  <div className="mt-4 space-y-3 text-sm text-white/70">
+                    <div className="flex items-center justify-between">
+                      <span>Downloads tracked</span>
+                      <span className="font-mono text-white/90">{downloads.length}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span>Active downloads</span>
+                      <span className="font-mono text-white/90">{hostStats.activeDownloads}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span>Queue cap</span>
+                      <span className="font-mono text-white/90">{hostSettings.maxConcurrentDownloads}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span>Segments per file</span>
+                      <span className="font-mono text-white/90">x{segmentsCount}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-white/10 bg-[#121212] p-4 text-sm text-white/60">
+                  <p className="font-medium text-white/85">Native host state</p>
+                  <p className="mt-2 leading-6">
+                    {hostStatus.connected
+                      ? 'The popup and options page are reading live state from the native host.'
+                      : hostStatus.lastError || 'The native host is unavailable. The extension UI will stay usable, but downloads will not start until the host reconnects.'}
+                  </p>
+                </div>
               </div>
             </aside>
           </div>
@@ -1273,6 +1422,86 @@ export default function App({ surface = 'dashboard' }: AppProps) {
       </div>
     );
   }
+
+  const grabberPanel = (
+    <div className="p-6 space-y-4">
+      <div className="flex flex-col gap-4 rounded-3xl border border-white/10 bg-[#141414] p-6 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <p className="text-[10px] uppercase tracking-widest font-mono text-white/40">Detected Streams</p>
+          <h2 className="mt-2 text-xl font-semibold tracking-tight text-white">Video Grabber</h2>
+          <p className="mt-2 max-w-2xl text-sm leading-6 text-white/60">
+            Scan current page for HLS or DASH manifests. Grab starts immediately. Review opens in-page overlay for quality selection.
+          </p>
+        </div>
+        <div className="flex gap-3">
+          <button
+            type="button"
+            onClick={() => void refreshDetectedStreams()}
+            className="rounded-xl border border-white/10 px-4 py-2 text-[11px] font-mono uppercase tracking-widest text-white/70 transition-colors hover:border-white/20 hover:text-white"
+          >
+            Refresh
+          </button>
+          <button
+            type="button"
+            onClick={() => void scanPageForVideos()}
+            disabled={isScanningPage}
+            className="rounded-xl bg-white px-4 py-2 text-[11px] font-mono uppercase tracking-widest text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {isScanningPage ? 'Scanning...' : 'Scan Page for Videos'}
+          </button>
+        </div>
+      </div>
+
+      {grabberNotice && (
+        <div className="rounded-2xl border border-white/10 bg-white/2 px-4 py-3 text-sm text-white/70">
+          {grabberNotice}
+        </div>
+      )}
+
+      <div className="rounded-3xl border border-white/10 bg-[#111111] p-4">
+        {detectedStreams.length === 0 ? (
+          <div className="flex min-h-55 flex-col items-center justify-center rounded-2xl border border-dashed border-white/10 bg-white/2 px-6 py-10 text-center">
+            <p className="text-sm font-medium text-white/85">No detected manifests yet</p>
+            <p className="mt-2 max-w-md text-sm leading-6 text-white/50">
+              Open page with HLS or DASH player, then run Scan Page for Videos. Network hits also appear here when permission and detection fire.
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {detectedStreams.map((stream) => (
+              <div key={`${stream.manifestType}:${stream.url}`} className="flex flex-col gap-4 rounded-2xl border border-white/10 bg-white/2 px-4 py-4 lg:flex-row lg:items-center lg:justify-between">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 text-[10px] font-mono uppercase tracking-widest text-white/40">
+                    <span>{stream.manifestType}</span>
+                    <span>{stream.source === 'page' ? 'page scan' : 'network'}</span>
+                    <span>{formatDetectedTimestamp(stream.detectedAt)}</span>
+                  </div>
+                  <div className="mt-2 truncate text-sm text-white/90" title={stream.url}>{stream.url}</div>
+                </div>
+                <div className="flex gap-3 lg:flex-none">
+                  <button
+                    type="button"
+                    onClick={() => void reviewDetectedStream(stream)}
+                    className="rounded-xl border border-white/10 px-4 py-2 text-[11px] font-mono uppercase tracking-widest text-white/70 transition-colors hover:border-white/20 hover:text-white"
+                  >
+                    Review
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void startVideoDownload(stream)}
+                    disabled={grabberBusyUrl === stream.url}
+                    className="rounded-xl bg-white px-4 py-2 text-[11px] font-mono uppercase tracking-widest text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {grabberBusyUrl === stream.url ? 'Queueing...' : 'Grab'}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 
   return (
     <div className="flex h-screen overflow-hidden bg-[#0A0A0A] text-[#EDEDED]">
@@ -1334,18 +1563,20 @@ export default function App({ surface = 'dashboard' }: AppProps) {
         </header>
 
         <div className="flex-1 overflow-auto relative">
-          <div className="grid grid-cols-[40px_1fr_120px_180px_120px_160px] gap-4 px-6 py-3 sticky top-0 border-b border-white/5 bg-[#0A0A0A]/90 backdrop-blur-xl z-10">
-            <div className="col-header">ID</div>
-            <div className="col-header">File Name</div>
-            <div className="col-header">Size</div>
-            <div className="col-header">Status / Progress</div>
-            <div className="col-header">Speed</div>
-            <div className="col-header">Actions</div>
-          </div>
+          {activeTab === 'grabber' ? grabberPanel : (
+            <>
+              <div className="grid grid-cols-[40px_1fr_120px_180px_120px_160px] gap-4 px-6 py-3 sticky top-0 border-b border-white/5 bg-[#0A0A0A]/90 backdrop-blur-xl z-10">
+                <div className="col-header">ID</div>
+                <div className="col-header">File Name</div>
+                <div className="col-header">Size</div>
+                <div className="col-header">Status / Progress</div>
+                <div className="col-header">Speed</div>
+                <div className="col-header">Actions</div>
+              </div>
 
-          <AnimatePresence>
-            <div className="p-3 space-y-1">
-              {filteredDownloads.map((download) => (
+              <AnimatePresence>
+                <div className="p-3 space-y-1">
+                  {filteredDownloads.map((download) => (
                 <motion.div
                   key={download.id}
                   layout
@@ -1469,10 +1700,12 @@ export default function App({ surface = 'dashboard' }: AppProps) {
                       </div>
                     )}
                   </div>
-                </motion.div>
-              ))}
-            </div>
-          </AnimatePresence>
+                    </motion.div>
+                  ))}
+                </div>
+              </AnimatePresence>
+            </>
+          )}
         </div>
 
         <footer className="h-8 border-t border-white/5 bg-[#0A0A0A] text-white/40 px-6 flex items-center justify-between text-[10px] font-mono uppercase tracking-widest gap-4">
