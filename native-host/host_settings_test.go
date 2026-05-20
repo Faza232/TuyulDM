@@ -68,3 +68,24 @@ func TestNormalizeHostSettingsClampsMaxSegmentsPerDownload(t *testing.T) {
 		}
 	}
 }
+
+func TestGetHostSettingsDefaultsVerifyIntegrityToTrue(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+
+	settings, err := storage.GetHostSettings()
+	if err != nil {
+		t.Fatalf("GetHostSettings returned error: %v", err)
+	}
+	if !settings.VerifyIntegrityEnabled() {
+		t.Fatal("expected verify integrity to default to true")
+	}
+}
+
+func TestApplyHostSettingsUpdateCanDisableVerifyIntegrity(t *testing.T) {
+	verifyIntegrity := false
+	updated := applyHostSettingsUpdate(defaultHostSettings(), HostSettingsUpdate{VerifyIntegrity: &verifyIntegrity})
+	if updated.VerifyIntegrityEnabled() {
+		t.Fatal("expected verify integrity update to persist false")
+	}
+}

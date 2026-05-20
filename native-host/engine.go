@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
@@ -126,6 +127,16 @@ type urlExpiredError struct {
 	Reason       string
 }
 
+type integrityMismatchError struct {
+	Algorithm string
+	Expected  string
+	Actual    string
+}
+
+type integritySkippedError struct {
+	Reason string
+}
+
 func (e *remoteChangeRecoveryError) Error() string {
 	return fmt.Sprintf("segment %d remote changed during resume", e.SegmentIndex)
 }
@@ -135,6 +146,20 @@ func (e *urlExpiredError) Error() string {
 		return e.Reason
 	}
 	return fmt.Sprintf("segment %d download link expired", e.SegmentIndex)
+}
+
+func (e *integrityMismatchError) Error() string {
+	if e == nil {
+		return "integrity mismatch"
+	}
+	return fmt.Sprintf("%s mismatch: expected %s, got %s", e.Algorithm, e.Expected, e.Actual)
+}
+
+func (e *integritySkippedError) Error() string {
+	if e == nil || strings.TrimSpace(e.Reason) == "" {
+		return "integrity skipped"
+	}
+	return fmt.Sprintf("integrity skipped: %s", e.Reason)
 }
 
 func (e *codedError) Error() string {
@@ -754,14 +779,35 @@ func (e *Engine) runDownload(a *ActiveDownload) {
 		if a.State.TotalSize <= 0 {
 			a.State.TotalSize = downloadedBytes(a.State)
 		}
-		if err := verifyDownloadIntegrity(a.State); err != nil {
-			err = withErrorCode("integrity_check_failed", err)
-			slog.Error("download integrity check failed",
-				"download_id", a.State.ID,
-				"url", a.State.URL,
-				"output_path", downloadPath(a.State),
-				"error", err,
-			)
+		if err := verifyDownloadIntegrity(a.State, e.hostSettingsSnapshot().VerifyIntegrityEnabled()); err != nil {
+			err = withErrorCode("integrity_failed", err)
+			var mismatchErr *integrityMismatchError
+			if errors.As(err, &mismatchErr) {
+				if renameErr := renameCorruptDownloadFile(a.State); renameErr != nil {
+					slog.Error("download corrupt rename failed",
+						"download_id", a.State.ID,
+						"url", a.State.URL,
+						"output_path", downloadPath(a.State),
+						"error", renameErr,
+					)
+				}
+				slog.Error("download integrity check failed",
+					"download_id", a.State.ID,
+					"url", a.State.URL,
+					"output_path", downloadPath(a.State),
+					"algorithm", mismatchErr.Algorithm,
+					"expected", mismatchErr.Expected,
+					"actual", mismatchErr.Actual,
+					"error", err,
+				)
+			} else {
+				slog.Error("download integrity check failed",
+					"download_id", a.State.ID,
+					"url", a.State.URL,
+					"output_path", downloadPath(a.State),
+					"error", err,
+				)
+			}
 			setDownloadFailureState(a.State, err)
 		} else {
 			a.State.Status = "finished"
@@ -1173,10 +1219,13 @@ func (e *Engine) completeSegment(a *ActiveDownload, idx int) error {
 	seg := &a.State.Segments[idx]
 	if seg.End >= 0 {
 		expected := seg.End - seg.Start + 1
-		if seg.Current < expected {
+		if seg.Current != expected {
 			a.mu.Unlock()
-			return io.ErrUnexpectedEOF
+			return withErrorCode("segment_size_mismatch", fmt.Errorf("segment %d size mismatch: expected %d, got %d", idx, expected, seg.Current))
 		}
+	} else if seg.Current <= 0 {
+		a.mu.Unlock()
+		return withErrorCode("segment_size_mismatch", fmt.Errorf("segment %d wrote no bytes before eof", idx))
 	}
 	seg.Completed = true
 	if a.State.TotalSize <= 0 && len(a.State.Segments) == 1 && seg.End < 0 {
@@ -2069,7 +2118,7 @@ func allSegmentsCompleted(state *DownloadState) bool {
 	return true
 }
 
-func verifyDownloadIntegrity(state *DownloadState) error {
+func verifyDownloadIntegrity(state *DownloadState, verifyHash bool) error {
 	if state.TotalSize > 0 {
 		var expected int64
 		for _, segment := range state.Segments {
@@ -2091,8 +2140,27 @@ func verifyDownloadIntegrity(state *DownloadState) error {
 		}
 	}
 
+	if !verifyHash {
+		slog.Info("download integrity skipped",
+			"download_id", state.ID,
+			"url", state.URL,
+			"event", "integrity_skipped",
+			"reason", "disabled",
+		)
+		return nil
+	}
+	if state.ContentMD5 == "" && state.Digest == "" {
+		slog.Info("download integrity skipped",
+			"download_id", state.ID,
+			"url", state.URL,
+			"event", "integrity_skipped",
+			"reason", "no_hash_headers",
+		)
+		return nil
+	}
+
 	if state.ContentMD5 != "" {
-		if err := verifyFileHash(downloadPath(state), md5.New(), state.ContentMD5); err != nil {
+		if err := verifyFileHash(downloadPath(state), "md5", md5.New(), state.ContentMD5); err != nil {
 			return fmt.Errorf("content-md5 mismatch: %w", err)
 		}
 	}
@@ -2106,20 +2174,31 @@ func verifyDownloadIntegrity(state *DownloadState) error {
 	return nil
 }
 
-func verifyFileHash(path string, hasher hash.Hash, expectedBase64 string) error {
+func verifyFileHash(path string, algorithm string, hasher hash.Hash, expectedBase64 string) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	if _, err := io.Copy(hasher, file); err != nil {
+	expectedBytes, err := base64.StdEncoding.DecodeString(strings.TrimSpace(expectedBase64))
+	if err != nil {
+		return fmt.Errorf("invalid %s digest: %w", algorithm, err)
+	}
+
+	buffer := make([]byte, 4*1024*1024)
+	if _, err := io.CopyBuffer(hasher, file, buffer); err != nil {
 		return err
 	}
 
-	actual := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
+	actualBytes := hasher.Sum(nil)
+	actual := base64.StdEncoding.EncodeToString(actualBytes)
 	if actual != strings.TrimSpace(expectedBase64) {
-		return fmt.Errorf("expected %s, got %s", expectedBase64, actual)
+		return &integrityMismatchError{
+			Algorithm: algorithm,
+			Expected:  hex.EncodeToString(expectedBytes),
+			Actual:    hex.EncodeToString(actualBytes),
+		}
 	}
 	return nil
 }
@@ -2137,18 +2216,18 @@ func verifyDigestHeader(path string, digestHeader string) error {
 
 		switch algorithm {
 		case "md5":
-			if err := verifyFileHash(path, md5.New(), expected); err != nil {
-				return fmt.Errorf("digest md5 mismatch: %w", err)
+			if err := verifyFileHash(path, "md5", md5.New(), expected); err != nil {
+				return err
 			}
 			verifiedAny = true
 		case "sha-256":
-			if err := verifyFileHash(path, sha256.New(), expected); err != nil {
-				return fmt.Errorf("digest sha-256 mismatch: %w", err)
+			if err := verifyFileHash(path, "sha-256", sha256.New(), expected); err != nil {
+				return err
 			}
 			verifiedAny = true
 		case "sha-512":
-			if err := verifyFileHash(path, sha512.New(), expected); err != nil {
-				return fmt.Errorf("digest sha-512 mismatch: %w", err)
+			if err := verifyFileHash(path, "sha-512", sha512.New(), expected); err != nil {
+				return err
 			}
 			verifiedAny = true
 		}
@@ -2158,6 +2237,39 @@ func verifyDigestHeader(path string, digestHeader string) error {
 		return nil
 	}
 	return nil
+}
+
+func renameCorruptDownloadFile(state *DownloadState) error {
+	currentPath := strings.TrimSpace(downloadPath(state))
+	if currentPath == "" {
+		return nil
+	}
+	targetPath := corruptOutputPath(currentPath)
+	if targetPath == currentPath {
+		return nil
+	}
+	if err := os.Rename(currentPath, targetPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	state.OutputPath = targetPath
+	state.Filename = filepath.Base(targetPath)
+	return nil
+}
+
+func corruptOutputPath(currentPath string) string {
+	baseTarget := currentPath + ".corrupt"
+	if _, err := os.Stat(baseTarget); os.IsNotExist(err) {
+		return baseTarget
+	}
+	for suffix := 2; ; suffix++ {
+		candidate := fmt.Sprintf("%s.%d", baseTarget, suffix)
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			return candidate
+		}
+	}
 }
 
 func downloadPath(state *DownloadState) string {

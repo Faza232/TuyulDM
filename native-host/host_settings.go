@@ -15,6 +15,7 @@ const (
 type HostSettings struct {
 	MaxConcurrentDownloads            int    `json:"maxConcurrentDownloads"`
 	MaxSegmentsPerDownload            int    `json:"maxSegmentsPerDownload"`
+	VerifyIntegrity                   *bool  `json:"verifyIntegrity,omitempty"`
 	GlobalThrottleBytesPerSecond      int64  `json:"globalThrottleBytesPerSecond"`
 	PerDownloadThrottleBytesPerSecond int64  `json:"perDownloadThrottleBytesPerSecond"`
 	SegmentStallTimeoutSec            int    `json:"segmentStallTimeoutSec"`
@@ -25,6 +26,7 @@ type HostSettings struct {
 type HostSettingsUpdate struct {
 	MaxConcurrentDownloads            *int    `json:"maxConcurrentDownloads,omitempty"`
 	MaxSegmentsPerDownload            *int    `json:"maxSegmentsPerDownload,omitempty"`
+	VerifyIntegrity                   *bool   `json:"verifyIntegrity,omitempty"`
 	GlobalThrottleBytesPerSecond      *int64  `json:"globalThrottleBytesPerSecond,omitempty"`
 	PerDownloadThrottleBytesPerSecond *int64  `json:"perDownloadThrottleBytesPerSecond,omitempty"`
 	SegmentStallTimeoutSec            *int    `json:"segmentStallTimeoutSec,omitempty"`
@@ -36,12 +38,16 @@ func defaultHostSettings() HostSettings {
 	return HostSettings{
 		MaxConcurrentDownloads: defaultMaxConcurrentDownloads,
 		MaxSegmentsPerDownload: defaultMaxSegmentsPerDownload,
+		VerifyIntegrity:        boolPtr(true),
 		SegmentStallTimeoutSec: defaultSegmentStallTimeoutSec,
 		LogLevel:               defaultHostLogLevel,
 	}
 }
 
 func normalizeHostSettings(settings HostSettings) HostSettings {
+	if settings.VerifyIntegrity == nil {
+		settings.VerifyIntegrity = boolPtr(true)
+	}
 	if settings.MaxConcurrentDownloads <= 0 {
 		settings.MaxConcurrentDownloads = defaultMaxConcurrentDownloads
 	}
@@ -80,6 +86,9 @@ func applyHostSettingsUpdate(current HostSettings, update HostSettingsUpdate) Ho
 	}
 	if update.MaxSegmentsPerDownload != nil {
 		current.MaxSegmentsPerDownload = *update.MaxSegmentsPerDownload
+	}
+	if update.VerifyIntegrity != nil {
+		current.VerifyIntegrity = boolPtr(*update.VerifyIntegrity)
 	}
 	if update.GlobalThrottleBytesPerSecond != nil {
 		current.GlobalThrottleBytesPerSecond = *update.GlobalThrottleBytesPerSecond
@@ -147,4 +156,12 @@ func hydrateHostSettings(settings HostSettings) (HostSettings, bool, error) {
 	}
 	normalized.DownloadDir = validatedDir
 	return normalized, changed, nil
+}
+
+func (s HostSettings) VerifyIntegrityEnabled() bool {
+	return s.VerifyIntegrity == nil || *s.VerifyIntegrity
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }

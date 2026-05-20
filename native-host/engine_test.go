@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -911,12 +913,12 @@ func TestEngineUpdateHostSettingsPersistsAndRebalancesSlots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetHostSettings returned error: %v", err)
 	}
-	if persisted != expected {
+	if !reflect.DeepEqual(persisted, expected) {
 		t.Fatalf("expected persisted settings %+v, got %+v", expected, persisted)
 	}
 
 	current := engine.HostSettings()
-	if current != expected {
+	if !reflect.DeepEqual(current, expected) {
 		t.Fatalf("expected in-memory settings %+v, got %+v", expected, current)
 	}
 
@@ -1864,6 +1866,220 @@ func TestEngineResumeAfterIntegrityErrorResetsSegments(t *testing.T) {
 		if segment.Completed {
 			t.Fatalf("expected segment %d completion reset", index)
 		}
+	}
+}
+
+func TestEngineDownloadLogsIntegritySkippedWithoutHashHeaders(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	settings := defaultHostSettings()
+	settings.DownloadDir = t.TempDir()
+	if err := engine.UpdateHostSettings(settings); err != nil {
+		t.Fatalf("UpdateHostSettings returned error: %v", err)
+	}
+	body := []byte(strings.Repeat("integrity-skip-", 128))
+	logBuffer := setTestLogger(t, slog.LevelInfo)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.Header().Set("ETag", `"integrity-skip"`)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{URL: server.URL + "/skip.bin", Filename: "skip.bin", Segments: 1})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if err := engine.Start(state.ID); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+
+	final := waitForTerminalState(t, storage, state.ID)
+	if final.Status != "finished" {
+		t.Fatalf("expected finished download, got %q (%s)", final.Status, final.Error)
+	}
+	logs := logBuffer.String()
+	if !strings.Contains(logs, "event=integrity_skipped") || !strings.Contains(logs, "reason=no_hash_headers") {
+		t.Fatalf("expected integrity_skipped log with no_hash_headers reason, got logs: %s", logs)
+	}
+	if strings.Contains(final.OutputPath, ".corrupt") {
+		t.Fatalf("did not expect corrupt rename for skipped integrity, got %q", final.OutputPath)
+	}
+}
+
+func TestEngineDownloadSkipsIntegrityWhenDisabled(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	settings := defaultHostSettings()
+	settings.DownloadDir = t.TempDir()
+	settings.VerifyIntegrity = boolPtr(false)
+	if err := engine.UpdateHostSettings(settings); err != nil {
+		t.Fatalf("UpdateHostSettings returned error: %v", err)
+	}
+	logBuffer := setTestLogger(t, slog.LevelInfo)
+
+	expectedBody := []byte(strings.Repeat("verify-off-", 128))
+	corruptBody := append([]byte(nil), expectedBody...)
+	corruptBody[len(corruptBody)/2] ^= 0xFF
+	expectedDigest := md5.Sum(expectedBody)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(corruptBody)))
+		w.Header().Set("Content-MD5", base64.StdEncoding.EncodeToString(expectedDigest[:]))
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(corruptBody)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{URL: server.URL + "/disabled.bin", Filename: "disabled.bin", Segments: 1})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	originalPath := state.OutputPath
+	if err := engine.Start(state.ID); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+
+	final := waitForTerminalState(t, storage, state.ID)
+	if final.Status != "finished" {
+		t.Fatalf("expected finished download with verify disabled, got %q (%s)", final.Status, final.Error)
+	}
+	if final.OutputPath != originalPath {
+		t.Fatalf("expected output path to remain %q, got %q", originalPath, final.OutputPath)
+	}
+	downloaded, err := os.ReadFile(final.OutputPath)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if !bytes.Equal(downloaded, corruptBody) {
+		t.Fatal("expected downloaded file to match corrupt body when verification disabled")
+	}
+	logs := logBuffer.String()
+	if !strings.Contains(logs, "event=integrity_skipped") || !strings.Contains(logs, "reason=disabled") {
+		t.Fatalf("expected integrity_skipped log with disabled reason, got logs: %s", logs)
+	}
+}
+
+func TestEngineDownloadIntegrityMismatchRenamesCorruptFile(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	settings := defaultHostSettings()
+	settings.DownloadDir = t.TempDir()
+	if err := engine.UpdateHostSettings(settings); err != nil {
+		t.Fatalf("UpdateHostSettings returned error: %v", err)
+	}
+	logBuffer := setTestLogger(t, slog.LevelInfo)
+
+	expectedBody := []byte(strings.Repeat("integrity-fail-", 128))
+	corruptBody := append([]byte(nil), expectedBody...)
+	corruptBody[len(corruptBody)/2] ^= 0xFF
+	expectedDigest := md5.Sum(expectedBody)
+	corruptDigest := md5.Sum(corruptBody)
+	flipOffset := len(expectedBody) / 2
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(corruptBody)))
+		w.Header().Set("Content-MD5", base64.StdEncoding.EncodeToString(expectedDigest[:]))
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+			start := 0
+			end := len(expectedBody) - 1
+			if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err != nil {
+				http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			chunk := append([]byte(nil), expectedBody[start:end+1]...)
+			if flipOffset >= start && flipOffset <= end {
+				chunk[flipOffset-start] ^= 0xFF
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(expectedBody)))
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(chunk)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(chunk)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(corruptBody)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{URL: server.URL + "/corrupt.bin", Filename: "corrupt.bin", Segments: 2})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	originalPath := state.OutputPath
+	if err := engine.Start(state.ID); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+
+	final := waitForTerminalState(t, storage, state.ID)
+	if final.Status != "error" {
+		t.Fatalf("expected integrity mismatch to fail, got %q", final.Status)
+	}
+	if final.ErrorCode != "integrity_failed" {
+		t.Fatalf("expected integrity_failed error code, got %q", final.ErrorCode)
+	}
+	if final.OutputPath != originalPath+".corrupt" {
+		t.Fatalf("expected corrupt rename to %q, got %q", originalPath+".corrupt", final.OutputPath)
+	}
+	if _, err := os.Stat(originalPath); !os.IsNotExist(err) {
+		t.Fatalf("expected original path to be renamed away, stat error: %v", err)
+	}
+	downloaded, err := os.ReadFile(final.OutputPath)
+	if err != nil {
+		t.Fatalf("ReadFile returned error: %v", err)
+	}
+	if !bytes.Equal(downloaded, corruptBody) {
+		t.Fatal("expected renamed corrupt file to preserve downloaded bytes")
+	}
+	logs := logBuffer.String()
+	if !strings.Contains(logs, "expected="+hex.EncodeToString(expectedDigest[:])) || !strings.Contains(logs, "actual="+hex.EncodeToString(corruptDigest[:])) {
+		t.Fatalf("expected integrity log to include expected and actual hex digests, got logs: %s", logs)
+	}
+}
+
+func TestEngineCompleteSegmentRejectsSizeMismatch(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	state := &DownloadState{
+		ID:        "segment-size-mismatch",
+		URL:       "https://example.com/file.bin",
+		Filename:  "file.bin",
+		Status:    "downloading",
+		Type:      "file",
+		CreatedAt: time.Now(),
+		Segments: []Segment{{
+			Index:   0,
+			Start:   0,
+			End:     9,
+			Current: 11,
+		}},
+	}
+
+	err := engine.completeSegment(&ActiveDownload{State: state}, 0)
+	if err == nil {
+		t.Fatal("expected segment size mismatch error")
+	}
+	if code := downloadErrorCode(err); code != "segment_size_mismatch" {
+		t.Fatalf("expected segment_size_mismatch error code, got %q", code)
 	}
 }
 
