@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -20,6 +21,8 @@ type DownloadState struct {
 	Speed             string            `json:"speed"`
 	Type              string            `json:"type"` // "file" or "video"
 	Error             string            `json:"error,omitempty"`
+	ErrorCode         string            `json:"error_code,omitempty"`
+	LastAttemptAt     time.Time         `json:"last_attempt_at,omitempty"`
 	CreatedAt         time.Time         `json:"created_at"`
 	Headers           map[string]string `json:"headers,omitempty"`
 	Cookies           []RequestCookie   `json:"cookies,omitempty"`
@@ -144,9 +147,11 @@ func (s *Storage) ListDownloads() ([]DownloadState, error) {
 		b := tx.Bucket([]byte(bucketName))
 		return b.ForEach(func(k, v []byte) error {
 			var d DownloadState
-			if err := json.Unmarshal(v, &d); err == nil {
-				list = append(list, d)
+			if err := json.Unmarshal(v, &d); err != nil {
+				slog.Warn("skip corrupted download record", "download_id", string(k), "error", err)
+				return nil
 			}
+			list = append(list, d)
 			return nil
 		})
 	})
@@ -159,6 +164,7 @@ func (s *Storage) PauseActiveDownloads() error {
 		return b.ForEach(func(k, v []byte) error {
 			var d DownloadState
 			if err := json.Unmarshal(v, &d); err != nil {
+				slog.Error("decode persisted download failed", "download_id", string(k), "error", err)
 				return err
 			}
 

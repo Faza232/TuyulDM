@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -32,21 +32,32 @@ type HostStatsPayload struct {
 }
 
 func main() {
-	// Redirect logs to stderr
-	fmt.Fprintln(os.Stderr, "TuyulDM Native Host Started")
+	configureBootstrapLogger()
+	slog.Info("native host starting")
 
 	dataDir, err := DataDir()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Data dir error:", err)
+		slog.Error("resolve data dir failed", "error", err)
 		return
 	}
-	fmt.Fprintln(os.Stderr, "Data dir:", dataDir)
 
 	storage, err := NewStorage(filepath.Join(dataDir, "tuyuldm.db"))
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Storage error:", err)
+		slog.Error("open storage failed", "error", err, "data_dir", dataDir)
 		return
 	}
+	settings, settingsErr := storage.GetHostSettings()
+	if settingsErr != nil {
+		slog.Warn("load host settings failed; using defaults", "error", settingsErr)
+		settings = defaultHostSettings()
+	}
+	if err := configureHostLogger(settings); err != nil {
+		slog.Error("configure host logger failed", "error", err, "data_dir", dataDir)
+	} else {
+		slog.Info("host logger ready", "path", filepath.Join(dataDir, "logs", hostLogFileName), "level", normalizeHostLogLevel(settings.LogLevel))
+	}
+	slog.Info("native host started", "data_dir", dataDir)
+
 	engine := NewEngine(storage, func(state DownloadState) {
 		msg := Response{
 			Status:  "ok",
@@ -58,11 +69,11 @@ func main() {
 		WriteMessage(os.Stdout, out)
 	})
 	if err := storage.PauseActiveDownloads(); err != nil {
-		fmt.Fprintln(os.Stderr, "Failed to pause stale downloads:", err)
+		slog.Warn("pause stale downloads failed", "error", err)
 	}
 	scheduler := newDownloadScheduler(storage, engine)
 	if err := scheduler.Reconcile(time.Now()); err != nil {
-		fmt.Fprintln(os.Stderr, "Initial scheduler reconcile failed:", err)
+		slog.Warn("initial scheduler reconcile failed", "error", err)
 	}
 	schedulerCtx, cancelScheduler := context.WithCancel(context.Background())
 	defer cancelScheduler()
@@ -72,14 +83,14 @@ func main() {
 		payload, err := ReadMessage(os.Stdin)
 		if err != nil {
 			if err != io.EOF {
-				fmt.Fprintln(os.Stderr, "Read error:", err)
+				slog.Error("read message failed", "error", err)
 			}
 			break
 		}
 
 		var req Request
 		if err := json.Unmarshal(payload, &req); err != nil {
-			fmt.Fprintln(os.Stderr, "Unmarshal error:", err)
+			slog.Error("unmarshal request failed", "error", err)
 			continue
 		}
 
@@ -92,7 +103,11 @@ func main() {
 			resp.Message = "pong"
 		case "video.inspect":
 			var params VideoDownloadRequest
-			json.Unmarshal(req.Params, &params)
+			if err := decodeParams(req, &params); err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				break
+			}
 			preview, err := previewVideoManifest(storageContext(), params)
 			if err != nil {
 				resp.Status = "error"
@@ -103,7 +118,11 @@ func main() {
 			}
 		case "download.add":
 			var params DownloadRequest
-			json.Unmarshal(req.Params, &params)
+			if err := decodeParams(req, &params); err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				break
+			}
 			state, err := engine.Add(params)
 			if err != nil {
 				resp.Status = "error"
@@ -116,7 +135,11 @@ func main() {
 			}
 		case "download.video":
 			var params VideoDownloadRequest
-			json.Unmarshal(req.Params, &params)
+			if err := decodeParams(req, &params); err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				break
+			}
 			state, err := engine.AddVideo(params)
 			if err != nil {
 				resp.Status = "error"
@@ -131,7 +154,11 @@ func main() {
 			var params struct {
 				ID string `json:"id"`
 			}
-			json.Unmarshal(req.Params, &params)
+			if err := decodeParams(req, &params); err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				break
+			}
 			if err := engine.Pause(params.ID); err != nil {
 				resp.Status = "error"
 				resp.Message = err.Error()
@@ -153,7 +180,11 @@ func main() {
 			var params struct {
 				ID string `json:"id"`
 			}
-			json.Unmarshal(req.Params, &params)
+			if err := decodeParams(req, &params); err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				break
+			}
 			err := engine.Resume(params.ID)
 			if err != nil {
 				resp.Status = "error"
@@ -210,7 +241,7 @@ func main() {
 		case "host.setSettings":
 			current := engine.HostSettings()
 			var params HostSettingsUpdate
-			if err := json.Unmarshal(req.Params, &params); err != nil {
+			if err := decodeParams(req, &params); err != nil {
 				resp.Status = "error"
 				resp.Message = err.Error()
 				break
@@ -230,7 +261,7 @@ func main() {
 				GlobalThrottleBytesPerSecond      *int64 `json:"globalThrottleBytesPerSecond,omitempty"`
 				PerDownloadThrottleBytesPerSecond *int64 `json:"perDownloadThrottleBytesPerSecond,omitempty"`
 			}
-			if err := json.Unmarshal(req.Params, &params); err != nil {
+			if err := decodeParams(req, &params); err != nil {
 				resp.Status = "error"
 				resp.Message = err.Error()
 				break
@@ -247,11 +278,26 @@ func main() {
 				resp.Status = "ok"
 				resp.Payload = engine.HostSettings()
 			}
+		case "host.openLogs":
+			logPath, err := ensureHostLogFile()
+			if err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				break
+			}
+			if err := openPathInDefaultApp(logPath); err != nil {
+				slog.Error("open logs failed", "error", err, "path", logPath)
+				resp.Status = "error"
+				resp.Message = err.Error()
+			} else {
+				resp.Status = "ok"
+				resp.Payload = map[string]string{"path": logPath}
+			}
 		case "download.getProgress":
 			var params struct {
 				ID string `json:"id"`
 			}
-			if err := json.Unmarshal(req.Params, &params); err != nil {
+			if err := decodeParams(req, &params); err != nil {
 				resp.Status = "error"
 				resp.Message = err.Error()
 			} else {
@@ -267,11 +313,12 @@ func main() {
 		default:
 			resp.Status = "error"
 			resp.Message = "Unknown method: " + req.Method
+			slog.Warn("unknown IPC method", "method", req.Method, "request_id", req.ID)
 		}
 
 		out, _ := json.Marshal(resp)
 		if err := WriteMessage(os.Stdout, out); err != nil {
-			fmt.Fprintln(os.Stderr, "Write error:", err)
+			slog.Error("write message failed", "error", err, "request_id", req.ID)
 			break
 		}
 	}
@@ -279,6 +326,17 @@ func main() {
 
 func storageContext() context.Context {
 	return context.Background()
+}
+
+func decodeParams(req Request, target interface{}) error {
+	if len(req.Params) == 0 || string(req.Params) == "null" {
+		return nil
+	}
+	if err := json.Unmarshal(req.Params, target); err != nil {
+		slog.Error("unmarshal request params failed", "error", err, "method", req.Method, "request_id", req.ID)
+		return err
+	}
+	return nil
 }
 
 func pauseAllDownloads(engine *Engine, downloads []DownloadState) error {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"os"
@@ -152,7 +153,6 @@ func (e *Engine) runVideoDownload(a *ActiveDownload) {
 					a.mu.Lock()
 					if lastError == nil {
 						lastError = err
-						a.State.Error = err.Error()
 						a.Cancel()
 					}
 					a.mu.Unlock()
@@ -191,15 +191,14 @@ func (e *Engine) runVideoDownload(a *ActiveDownload) {
 		if errors.Is(a.Ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
 			a.State.Status = "paused"
 		} else {
-			a.State.Status = "error"
-			a.State.Error = err.Error()
+			setDownloadFailureState(a.State, err)
 		}
 		a.State.Speed = "0 B/s"
 	} else {
 		a.State.Status = "finished"
 		a.State.Progress = 100
 		a.State.Speed = "0 B/s"
-		a.State.Error = ""
+		clearDownloadFailureState(a.State)
 		if info, statErr := os.Stat(downloadPath(a.State)); statErr == nil {
 			a.State.TotalSize = info.Size()
 		}
@@ -289,8 +288,22 @@ func (e *Engine) downloadVideoSegment(a *ActiveDownload, idx int, segmentDir str
 
 		var retryErr *retryableStatusError
 		if errors.As(err, &retryErr) {
+			a.mu.Lock()
+			downloadID := a.State.ID
+			segmentURL := a.State.Segments[idx].URL
+			a.mu.Unlock()
+			e.recordRetryableAttempt(a, idx, segmentURL, attempt+1, retryErr, "video segment retry scheduled")
 			if attempt == maxSegmentRetries-1 {
-				return err
+				finalErr := withErrorCode(downloadErrorCode(err), fmt.Errorf("video segment %d exhausted retries: %w", idx, err))
+				slog.Error("video segment exhausted retries",
+					"download_id", downloadID,
+					"url", segmentURL,
+					"attempt", attempt+1,
+					"segment_index", idx,
+					"retryable_status", retryErr.StatusCode,
+					"retry_after_ms", retryErr.RetryAfter.Milliseconds(),
+				)
+				return finalErr
 			}
 			if waitErr := waitForRetry(a.Ctx, retryErr.RetryAfter); waitErr != nil {
 				return waitErr
@@ -301,12 +314,13 @@ func (e *Engine) downloadVideoSegment(a *ActiveDownload, idx int, segmentDir str
 		return err
 	}
 
-	return fmt.Errorf("video segment %d exhausted retries", idx)
+	return withErrorCode("download_failed", fmt.Errorf("video segment %d exhausted retries", idx))
 }
 
 func (e *Engine) downloadVideoSegmentAttempt(a *ActiveDownload, idx int, segmentDir string) error {
 	a.mu.Lock()
 	segment := a.State.Segments[idx]
+	downloadID := a.State.ID
 	headers := cloneStringMap(a.State.Headers)
 	cookies := append([]RequestCookie(nil), a.State.Cookies...)
 	perDownloadLimiter := a.PerDownloadLimiter
@@ -369,7 +383,14 @@ func (e *Engine) downloadVideoSegmentAttempt(a *ActiveDownload, idx int, segment
 
 	switch {
 	case rangeRequested && segment.End >= segment.Start && segment.End >= 0 && resp.StatusCode != http.StatusPartialContent:
-		return fmt.Errorf("video range request returned status %d", resp.StatusCode)
+		err := &statusCodeError{StatusCode: resp.StatusCode, Message: "video range request returned status"}
+		slog.Error("video segment range request failed",
+			"download_id", downloadID,
+			"url", segment.URL,
+			"segment_index", idx,
+			"status_code", resp.StatusCode,
+		)
+		return err
 	case rangeRequested && segment.End < 0 && resumeOffset > 0 && resp.StatusCode == http.StatusOK:
 		if err := file.Truncate(0); err != nil {
 			return err
@@ -379,9 +400,23 @@ func (e *Engine) downloadVideoSegmentAttempt(a *ActiveDownload, idx int, segment
 		a.State.Segments[idx].Current = 0
 		a.mu.Unlock()
 	case !rangeRequested && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent:
-		return fmt.Errorf("unexpected video segment status %d", resp.StatusCode)
+		err := &statusCodeError{StatusCode: resp.StatusCode, Message: "unexpected video segment status"}
+		slog.Error("video segment request failed",
+			"download_id", downloadID,
+			"url", segment.URL,
+			"segment_index", idx,
+			"status_code", resp.StatusCode,
+		)
+		return err
 	case rangeRequested && resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK:
-		return fmt.Errorf("unexpected video segment status %d", resp.StatusCode)
+		err := &statusCodeError{StatusCode: resp.StatusCode, Message: "unexpected video segment status"}
+		slog.Error("video segment request failed",
+			"download_id", downloadID,
+			"url", segment.URL,
+			"segment_index", idx,
+			"status_code", resp.StatusCode,
+		)
+		return err
 	}
 
 	buf := make([]byte, 32*1024)
@@ -560,5 +595,17 @@ func (e *Engine) muxVideoSegments(a *ActiveDownload, inputs []videoTrackInput, o
 	args = append(args, "-movflags", "+faststart", output)
 
 	cmd := exec.CommandContext(a.Ctx, ffmpegBinary, args...)
-	return cmd.Run()
+	outputBytes, err := cmd.CombinedOutput()
+	if err != nil {
+		wrapped := withErrorCode("ffmpeg_mux_failed", fmt.Errorf("ffmpeg mux failed: %w", err))
+		slog.Error("ffmpeg mux failed",
+			"download_id", a.State.ID,
+			"url", a.State.URL,
+			"output_path", output,
+			"error", wrapped,
+			"ffmpeg_output_tail", trimLogTail(outputBytes, 4096),
+		)
+		return wrapped
+	}
+	return nil
 }

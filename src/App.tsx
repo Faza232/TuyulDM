@@ -37,6 +37,8 @@ interface DownloadItem {
   status: 'downloading' | 'paused' | 'finished' | 'queued' | 'error' | 'muxing';
   type?: string;
   error?: string;
+  error_code?: string;
+  last_attempt_at?: string;
 }
 
 interface InterceptionSettings {
@@ -67,6 +69,7 @@ interface HostSettings {
   maxConcurrentDownloads: number;
   globalThrottleBytesPerSecond: number;
   perDownloadThrottleBytesPerSecond: number;
+  logLevel: string;
 }
 
 interface DownloadSchedulePayload {
@@ -103,6 +106,7 @@ const DEFAULT_HOST_SETTINGS: HostSettings = {
   maxConcurrentDownloads: 3,
   globalThrottleBytesPerSecond: 0,
   perDownloadThrottleBytesPerSecond: 0,
+  logLevel: 'info',
 };
 
 const HOST_SETTINGS_STORAGE_KEY = 'tuyuldm_host_settings';
@@ -232,6 +236,11 @@ function normalizeHostStats(stats: Partial<HostStats> | undefined): HostStats {
   };
 }
 
+function normalizeLogLevel(value: unknown) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : DEFAULT_HOST_SETTINGS.logLevel;
+  return ['debug', 'info', 'warn', 'error'].includes(normalized) ? normalized : DEFAULT_HOST_SETTINGS.logLevel;
+}
+
 function normalizeHostSettings(settings: Partial<HostSettings> | undefined): HostSettings {
   return {
     maxConcurrentDownloads: Number.isFinite(Number(settings?.maxConcurrentDownloads))
@@ -243,6 +252,7 @@ function normalizeHostSettings(settings: Partial<HostSettings> | undefined): Hos
     perDownloadThrottleBytesPerSecond: Number.isFinite(Number(settings?.perDownloadThrottleBytesPerSecond))
       ? Math.max(0, Number(settings?.perDownloadThrottleBytesPerSecond))
       : DEFAULT_HOST_SETTINGS.perDownloadThrottleBytesPerSecond,
+    logLevel: normalizeLogLevel(settings?.logLevel),
   };
 }
 
@@ -301,6 +311,18 @@ function formatSize(bytes: number | string) {
 
 function formatSpeed(bytesPerSecond: number) {
   return `${formatSize(bytesPerSecond)}/s`;
+}
+
+function formatAttemptTimestamp(value: string | undefined) {
+  if (!value) {
+    return 'unknown';
+  }
+
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) {
+    return value;
+  }
+  return timestamp.toLocaleString();
 }
 
 export default function App({ surface = 'dashboard' }: AppProps) {
@@ -626,6 +648,17 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     }
 
     window.open('/options.html', '_blank', 'noopener,noreferrer');
+  };
+
+  const openLogs = async () => {
+    if (!isExtensionRuntimeAvailable()) {
+      return;
+    }
+
+    const response = await sendExtensionMessage<{ error?: string }>({ type: 'OPEN_LOGS' });
+    if (response?.error) {
+      console.error('Failed to open host logs:', response.error);
+    }
   };
 
   const filteredDownloads = downloads.filter((download) => {
@@ -1081,6 +1114,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
         </nav>
 
         <div className="p-4 border-t border-white/5 space-y-1">
+          <SidebarItem icon={<Activity className="w-4 h-4" />} label="Logs" onClick={() => void openLogs()} />
           <SidebarItem icon={<Settings className="w-4 h-4" />} label="Settings" onClick={() => setIsSettingsOpen(true)} />
           <SidebarItem icon={<Github className="w-4 h-4" />} label="Source Code" />
         </div>
@@ -1136,7 +1170,17 @@ export default function App({ surface = 'dashboard' }: AppProps) {
                   <div className="data-value opacity-40">{typeof download.id === 'number' ? download.id.toString().padStart(2, '0') : download.id.substring(0, 4)}</div>
                   <div className="flex flex-col min-w-0 pr-4">
                     <div className="font-medium truncate text-[13px] text-white/90">{download.name || download.filename}</div>
-                    {download.status === 'error' && download.error && <div className="text-xs text-red-400 mt-0.5 truncate" title={download.error}>{download.error}</div>}
+                    {download.status === 'error' && (download.error || download.error_code || download.last_attempt_at) && (
+                      <div className="mt-0.5">
+                        {download.error && <div className="text-xs text-red-400 truncate" title={download.error}>{download.error}</div>}
+                        {(download.error_code || download.last_attempt_at) && (
+                          <div className="mt-1 hidden rounded-md border border-red-500/20 bg-red-500/10 px-2.5 py-2 text-[10px] font-mono text-red-200 shadow-lg group-hover:block">
+                            {download.error_code && <div>Code: {download.error_code}</div>}
+                            {download.last_attempt_at && <div>Last Attempt: {formatAttemptTimestamp(download.last_attempt_at)}</div>}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                   <div className="data-value">{formatSize((download as any).total_size ?? download.size ?? 0)}</div>
                   <div className="space-y-2 pr-4">

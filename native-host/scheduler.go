@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"time"
 )
 
@@ -28,7 +29,9 @@ func (scheduler *downloadScheduler) Start(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			_ = scheduler.Reconcile(now)
+			if err := scheduler.Reconcile(now); err != nil {
+				slog.Error("scheduler reconcile failed", "error", err, "timestamp", now.UTC())
+			}
 		}
 	}
 }

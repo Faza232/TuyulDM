@@ -234,6 +234,7 @@ func TestEngineUpdateHostSettingsPersistsAndRebalancesSlots(t *testing.T) {
 		GlobalThrottleBytesPerSecond:      2048,
 		PerDownloadThrottleBytesPerSecond: 1024,
 	}
+	expected := normalizeHostSettings(settings)
 	if err := engine.UpdateHostSettings(settings); err != nil {
 		t.Fatalf("UpdateHostSettings returned error: %v", err)
 	}
@@ -242,20 +243,20 @@ func TestEngineUpdateHostSettingsPersistsAndRebalancesSlots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetHostSettings returned error: %v", err)
 	}
-	if persisted != settings {
-		t.Fatalf("expected persisted settings %+v, got %+v", settings, persisted)
+	if persisted != expected {
+		t.Fatalf("expected persisted settings %+v, got %+v", expected, persisted)
 	}
 
 	current := engine.HostSettings()
-	if current != settings {
-		t.Fatalf("expected in-memory settings %+v, got %+v", settings, current)
+	if current != expected {
+		t.Fatalf("expected in-memory settings %+v, got %+v", expected, current)
 	}
 
 	if engine.globalLimiter == nil {
 		t.Fatal("expected global limiter to be configured")
 	}
-	if len(engine.slotPool) != settings.MaxConcurrentDownloads {
-		t.Fatalf("expected %d available slots, got %d", settings.MaxConcurrentDownloads, len(engine.slotPool))
+	if len(engine.slotPool) != expected.MaxConcurrentDownloads {
+		t.Fatalf("expected %d available slots, got %d", expected.MaxConcurrentDownloads, len(engine.slotPool))
 	}
 }
 

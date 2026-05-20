@@ -607,6 +607,13 @@ browserApi.runtime.onMessage.addListener(((message: any, _sender: any, sendRespo
     return true;
   }
 
+  if (message.type === 'OPEN_LOGS') {
+    sendHostRequest('host.openLogs')
+      .then((response) => sendResponse({ result: response.payload, status: hostStatus }))
+      .catch((error) => sendResponse({ error: String(error), status: hostStatus }));
+    return true;
+  }
+
   if (message.type === 'START_VIDEO_DOWNLOAD') {
     Promise.all([buildForwardedRequestContext(message.url), getInterceptionSettings()])
       .then(([requestContext, settings]) => sendHostRequest('download.video', {

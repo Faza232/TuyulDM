@@ -10,12 +10,14 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +63,100 @@ type retryableStatusError struct {
 
 func (e *retryableStatusError) Error() string {
 	return fmt.Sprintf("retryable status %d", e.StatusCode)
+}
+
+type statusCodeError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *statusCodeError) Error() string {
+	return fmt.Sprintf("%s %d", strings.TrimSpace(e.Message), e.StatusCode)
+}
+
+type codedError struct {
+	Code string
+	Err  error
+}
+
+func (e *codedError) Error() string {
+	if e.Err == nil {
+		return e.Code
+	}
+	return e.Err.Error()
+}
+
+func (e *codedError) Unwrap() error {
+	return e.Err
+}
+
+func withErrorCode(code string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &codedError{Code: code, Err: err}
+}
+
+func clearDownloadFailureState(state *DownloadState) {
+	state.Error = ""
+	state.ErrorCode = ""
+	state.LastAttemptAt = time.Time{}
+}
+
+func noteDownloadAttempt(state *DownloadState, err error) {
+	state.ErrorCode = downloadErrorCode(err)
+	state.LastAttemptAt = time.Now().UTC()
+}
+
+func setDownloadFailureState(state *DownloadState, err error) {
+	state.Status = "error"
+	state.Speed = "0 B/s"
+	state.Error = err.Error()
+	noteDownloadAttempt(state, err)
+}
+
+func downloadErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	var coded *codedError
+	if errors.As(err, &coded) && strings.TrimSpace(coded.Code) != "" {
+		return coded.Code
+	}
+
+	var retryErr *retryableStatusError
+	if errors.As(err, &retryErr) {
+		return strconv.Itoa(retryErr.StatusCode)
+	}
+
+	var statusErr *statusCodeError
+	if errors.As(err, &statusErr) {
+		return strconv.Itoa(statusErr.StatusCode)
+	}
+
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return "unexpected_eof"
+	}
+
+	return "download_failed"
+}
+
+func (e *Engine) recordRetryableAttempt(a *ActiveDownload, idx int, requestURL string, attempt int, retryErr *retryableStatusError, event string) {
+	a.mu.Lock()
+	noteDownloadAttempt(a.State, retryErr)
+	snapshot := cloneDownloadState(a.State)
+	a.mu.Unlock()
+
+	e.persistSnapshot(snapshot)
+	slog.Warn(event,
+		"download_id", snapshot.ID,
+		"url", requestURL,
+		"attempt", attempt,
+		"segment_index", idx,
+		"retryable_status", retryErr.StatusCode,
+		"retry_after_ms", retryErr.RetryAfter.Milliseconds(),
+	)
 }
 
 type Engine struct {
@@ -199,7 +295,7 @@ func (e *Engine) Start(id string) error {
 	e.mu.Unlock()
 
 	state.Status = "queued"
-	state.Error = ""
+	clearDownloadFailureState(state)
 	state.Speed = "0 B/s"
 	state.WasUserPaused = false
 	if err := e.storage.SaveDownload(state); err != nil {
@@ -253,7 +349,6 @@ func (e *Engine) runDownload(a *ActiveDownload) {
 				a.mu.Lock()
 				if lastError == nil {
 					lastError = err
-					a.State.Error = err.Error()
 					a.Cancel()
 				}
 				a.mu.Unlock()
@@ -305,21 +400,25 @@ func (e *Engine) runDownload(a *ActiveDownload) {
 	a.mu.Lock()
 	allDone := allSegmentsCompleted(a.State)
 	if lastError != nil {
-		a.State.Status = "error"
-		a.State.Speed = "0 B/s"
+		setDownloadFailureState(a.State, lastError)
 	} else if allDone {
 		if a.State.TotalSize <= 0 {
 			a.State.TotalSize = downloadedBytes(a.State)
 		}
 		if err := verifyDownloadIntegrity(a.State); err != nil {
-			a.State.Status = "error"
-			a.State.Speed = "0 B/s"
-			a.State.Error = err.Error()
+			err = withErrorCode("integrity_check_failed", err)
+			slog.Error("download integrity check failed",
+				"download_id", a.State.ID,
+				"url", a.State.URL,
+				"output_path", downloadPath(a.State),
+				"error", err,
+			)
+			setDownloadFailureState(a.State, err)
 		} else {
 			a.State.Status = "finished"
 			a.State.Progress = 100
 			a.State.Speed = "0 B/s"
-			a.State.Error = ""
+			clearDownloadFailureState(a.State)
 		}
 	} else {
 		a.State.Status = "paused"
@@ -353,8 +452,22 @@ func (e *Engine) downloadSegment(a *ActiveDownload, idx int) error {
 
 		var retryErr *retryableStatusError
 		if errors.As(err, &retryErr) {
+			a.mu.Lock()
+			downloadID := a.State.ID
+			requestURL := a.State.URL
+			a.mu.Unlock()
+			e.recordRetryableAttempt(a, idx, requestURL, attempt+1, retryErr, "segment retry scheduled")
 			if attempt == maxSegmentRetries-1 {
-				return err
+				finalErr := withErrorCode(downloadErrorCode(err), fmt.Errorf("segment %d exhausted retries: %w", idx, err))
+				slog.Error("segment exhausted retries",
+					"download_id", downloadID,
+					"url", requestURL,
+					"attempt", attempt+1,
+					"segment_index", idx,
+					"retryable_status", retryErr.StatusCode,
+					"retry_after_ms", retryErr.RetryAfter.Milliseconds(),
+				)
+				return finalErr
 			}
 			if waitErr := waitForRetry(a.Ctx, retryErr.RetryAfter); waitErr != nil {
 				return waitErr
@@ -365,12 +478,13 @@ func (e *Engine) downloadSegment(a *ActiveDownload, idx int) error {
 		return err
 	}
 
-	return fmt.Errorf("segment %d exhausted retries", idx)
+	return withErrorCode("download_failed", fmt.Errorf("segment %d exhausted retries", idx))
 }
 
 func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int) error {
 	a.mu.Lock()
 	seg := a.State.Segments[idx]
+	downloadID := a.State.ID
 	stateURL := a.State.URL
 	headers := cloneStringMap(a.State.Headers)
 	cookies := append([]RequestCookie(nil), a.State.Cookies...)
@@ -417,9 +531,23 @@ func (e *Engine) downloadSegmentAttempt(a *ActiveDownload, idx int) error {
 
 	switch {
 	case rangeRequested && resp.StatusCode != http.StatusPartialContent:
-		return fmt.Errorf("range request returned status %d", resp.StatusCode)
+		err := &statusCodeError{StatusCode: resp.StatusCode, Message: "range request returned status"}
+		slog.Error("segment range request failed",
+			"download_id", downloadID,
+			"url", stateURL,
+			"segment_index", idx,
+			"status_code", resp.StatusCode,
+		)
+		return err
 	case !rangeRequested && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent:
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		err := &statusCodeError{StatusCode: resp.StatusCode, Message: "unexpected status code"}
+		slog.Error("segment request failed",
+			"download_id", downloadID,
+			"url", stateURL,
+			"segment_index", idx,
+			"status_code", resp.StatusCode,
+		)
+		return err
 	}
 
 	writeOffset := startOffset
@@ -542,6 +670,7 @@ func (e *Engine) Resume(id string) error {
 func (e *Engine) probeDownload(downloadURL string, headers map[string]string, cookies []RequestCookie) (downloadMetadata, error) {
 	headResp, finalURL, err := doRequestWithRedirects(context.Background(), http.MethodHead, downloadURL, headers, cookies, nil)
 	if err != nil {
+		slog.Warn("download probe head request failed", "url", downloadURL, "error", err)
 		return downloadMetadata{}, err
 	}
 
@@ -560,6 +689,11 @@ func (e *Engine) probeDownload(downloadURL string, headers map[string]string, co
 		if headStatus == http.StatusOK && headMeta.TotalSize > 0 {
 			return headMeta, nil
 		}
+		slog.Warn("download probe fallback request failed",
+			"url", finalURL,
+			"head_status_code", headStatus,
+			"error", rangeErr,
+		)
 		return downloadMetadata{}, rangeErr
 	}
 	defer rangeResp.Body.Close()
@@ -578,7 +712,13 @@ func (e *Engine) probeDownload(downloadURL string, headers map[string]string, co
 		if headStatus == http.StatusOK && headMeta.TotalSize > 0 {
 			return headMeta, nil
 		}
-		return downloadMetadata{}, fmt.Errorf("metadata probe returned status %d", rangeResp.StatusCode)
+		err := &statusCodeError{StatusCode: rangeResp.StatusCode, Message: "metadata probe returned status"}
+		slog.Warn("download probe rejected",
+			"url", rangeURL,
+			"head_status_code", headStatus,
+			"status_code", rangeResp.StatusCode,
+		)
+		return downloadMetadata{}, err
 	}
 }
 
@@ -994,12 +1134,16 @@ func (e *Engine) failDownload(a *ActiveDownload, err error) {
 	e.releaseActiveSlot(a.State.ID)
 
 	a.mu.Lock()
-	a.State.Status = "error"
-	a.State.Speed = "0 B/s"
-	a.State.Error = err.Error()
+	setDownloadFailureState(a.State, err)
 	snapshot := cloneDownloadState(a.State)
 	a.mu.Unlock()
 
+	slog.Error("download failed",
+		"download_id", snapshot.ID,
+		"url", snapshot.URL,
+		"error", err,
+		"error_code", snapshot.ErrorCode,
+	)
 	e.persistSnapshot(snapshot)
 }
 

@@ -9,3 +9,5 @@ require golang.org/x/sys v0.4.0
 require golang.org/x/time v0.11.0
 
 require github.com/grafov/m3u8 v0.12.1
+
+require gopkg.in/natefinch/lumberjack.v2 v2.2.1
