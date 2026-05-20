@@ -3,6 +3,7 @@ import browser from 'webextension-polyfill';
 const browserApi = browser as any;
 const HOST_NAME = 'com.tuyuldm.daemon';
 const SETTINGS_KEY = 'interceptionSettings';
+const PERMISSION_ONBOARDING_DISMISSED_KEY = 'permissionOnboardingDismissed';
 const REQUEST_HEADER_TTL_MS = 30_000;
 const SEND_HEADERS_EXTRA_INFO = typeof browser.runtime.getBrowserInfo === 'function'
   ? ['requestHeaders']
@@ -40,6 +41,16 @@ type DetectedStreamEntry = {
   source: 'network' | 'page';
 };
 
+type PermissionStatusPayload = {
+  currentOrigin: string;
+  currentOriginPattern: string;
+  currentOriginGranted: boolean;
+  canRequestCurrentOrigin: boolean;
+  hasAllUrlsPermission: boolean;
+  grantedOrigins: string[];
+  shouldShowOnboarding: boolean;
+};
+
 let port: any | null = null;
 let progressInterval: ReturnType<typeof setInterval> | null = null;
 const activeDownloads = new Set<string>();
@@ -62,6 +73,70 @@ function broadcastRuntimeMessage(message: Record<string, unknown>) {
 function updateHostStatus(nextStatus: Partial<typeof hostStatus>) {
   hostStatus = { ...hostStatus, ...nextStatus };
   broadcastRuntimeMessage({ type: 'HOST_STATUS', payload: hostStatus });
+}
+
+function normalizeGrantedOrigins(origins: unknown) {
+  if (!Array.isArray(origins)) {
+    return [] as string[];
+  }
+
+  return [...new Set(origins.map((origin) => String(origin || '').trim()).filter(Boolean))].sort((left, right) => {
+    if (left === '<all_urls>') {
+      return -1;
+    }
+    if (right === '<all_urls>') {
+      return 1;
+    }
+    return left.localeCompare(right);
+  });
+}
+
+function isRequestableOriginUrl(rawUrl: string) {
+  try {
+    const parsed = new URL(rawUrl);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+async function getPermissionStatus(): Promise<PermissionStatusPayload> {
+  const tab = await getActiveTab();
+  const currentUrl = typeof tab?.url === 'string' ? tab.url : '';
+  const currentOriginPattern = getOriginPattern(currentUrl) ?? '';
+  const currentOrigin = currentOriginPattern ? new URL(currentUrl).origin : '';
+  const grantedPermissions = await browserApi.permissions.getAll();
+  const grantedOrigins = normalizeGrantedOrigins(grantedPermissions?.origins);
+  const hasAllUrlsPermission = grantedOrigins.includes('<all_urls>')
+    || await browserApi.permissions.contains({ origins: ['<all_urls>'] });
+  const canRequestCurrentOrigin = !!currentOriginPattern && isRequestableOriginUrl(currentUrl);
+  const currentOriginGranted = canRequestCurrentOrigin
+    ? hasAllUrlsPermission
+      || grantedOrigins.includes(currentOriginPattern)
+      || await browserApi.permissions.contains({ origins: [currentOriginPattern] })
+    : false;
+  const stored = await browserApi.storage.local.get(PERMISSION_ONBOARDING_DISMISSED_KEY);
+  const shouldShowOnboarding = !hasAllUrlsPermission && stored?.[PERMISSION_ONBOARDING_DISMISSED_KEY] !== true;
+
+  return {
+    currentOrigin,
+    currentOriginPattern,
+    currentOriginGranted,
+    canRequestCurrentOrigin,
+    hasAllUrlsPermission,
+    grantedOrigins,
+    shouldShowOnboarding,
+  };
+}
+
+async function broadcastPermissionStatus() {
+  const status = await getPermissionStatus();
+  broadcastRuntimeMessage({ type: 'PERMISSIONS_UPDATED', payload: status });
+  return status;
+}
+
+async function setPermissionOnboardingDismissed(value: boolean) {
+  await browserApi.storage.local.set({ [PERMISSION_ONBOARDING_DISMISSED_KEY]: value });
 }
 
 function normalizeManifestType(value: unknown): DetectedStreamEntry['manifestType'] | '' {
@@ -345,6 +420,14 @@ async function ensureOriginPermission(url: string) {
     return false;
   }
 }
+
+browserApi.runtime.onInstalled?.addListener((details: any) => {
+  if (details?.reason === 'install') {
+    void browserApi.storage.local.remove(PERMISSION_ONBOARDING_DISMISSED_KEY).catch(() => {
+      // Ignore storage cleanup errors on first install.
+    });
+  }
+});
 
 function shouldInterceptDownload(item: any, settings: ReturnType<typeof normalizeInterceptionSettings>) {
   if (!settings.enabled || !item?.url) {
@@ -726,6 +809,62 @@ browserApi.runtime.onMessage.addListener(((message: any, _sender: any, sendRespo
     getInterceptionSettings()
       .then((settings) => sendResponse({ settings }))
       .catch((error) => sendResponse({ error: String(error) }));
+    return true;
+  }
+
+  if (message.type === 'GET_PERMISSION_STATUS') {
+    getPermissionStatus()
+      .then((status) => sendResponse({ status }))
+      .catch((error) => sendResponse({ error: String(error), status: null }));
+    return true;
+  }
+
+  if (message.type === 'REQUEST_ALL_URLS_PERMISSION') {
+    browserApi.permissions.request({ origins: ['<all_urls>'] })
+      .then(async (granted: boolean) => {
+        if (granted) {
+          await setPermissionOnboardingDismissed(true);
+        }
+        return { granted, status: await broadcastPermissionStatus() };
+      })
+      .then((result: any) => sendResponse(result))
+      .catch((error: unknown) => sendResponse({ error: String(error), granted: false, status: null }));
+    return true;
+  }
+
+  if (message.type === 'REQUEST_CURRENT_TAB_PERMISSION') {
+    getPermissionStatus()
+      .then(async (status) => {
+        if (!status.currentOriginPattern || !status.canRequestCurrentOrigin) {
+          return { granted: false, status };
+        }
+        const granted = await browserApi.permissions.request({ origins: [status.currentOriginPattern] });
+        return { granted, status: await broadcastPermissionStatus() };
+      })
+      .then((result: any) => sendResponse(result))
+      .catch((error: unknown) => sendResponse({ error: String(error), granted: false, status: null }));
+    return true;
+  }
+
+  if (message.type === 'DISMISS_PERMISSION_ONBOARDING') {
+    setPermissionOnboardingDismissed(true)
+      .then(() => broadcastPermissionStatus())
+      .then((status) => sendResponse({ status }))
+      .catch((error) => sendResponse({ error: String(error), status: null }));
+    return true;
+  }
+
+  if (message.type === 'REVOKE_GRANTED_PERMISSION') {
+    const origin = String(message.origin || '').trim();
+    if (!origin) {
+      sendResponse({ error: 'origin is required', status: null });
+      return false;
+    }
+
+    browserApi.permissions.remove({ origins: [origin] })
+      .then(async () => ({ status: await broadcastPermissionStatus() }))
+      .then((result: any) => sendResponse(result))
+      .catch((error: unknown) => sendResponse({ error: String(error), status: null }));
     return true;
   }
 

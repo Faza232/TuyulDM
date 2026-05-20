@@ -30,10 +30,14 @@ During local development you can override this with `TUYULDM_FFMPEG=/absolute/pa
 	```bash
 	npm run build
 	```
+1. Load only the built `dist/` bundle.
+   Source files under `extension/src/` and the source `extension/manifest.json` intentionally reference TypeScript entrypoints for Vite/CRX rewrite. They are not loadable as an unpacked extension by themselves.
 1. Open Chrome/Brave and go to `chrome://extensions`.
 2. Enable "Developer mode".
 3. Click "Load unpacked" and select the `/dist` folder in this project.
 4. Note the Extension ID (e.g., `abcdefg...`).
+
+Never load repo root or `extension/` directly in the browser. Always load `dist/` after `npm run build`.
 
 ### 3. Register the Native Host
 

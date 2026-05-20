@@ -65,6 +65,16 @@ interface DetectedStreamItem {
   source?: string;
 }
 
+interface PermissionStatus {
+  currentOrigin: string;
+  currentOriginPattern: string;
+  currentOriginGranted: boolean;
+  canRequestCurrentOrigin: boolean;
+  hasAllUrlsPermission: boolean;
+  grantedOrigins: string[];
+  shouldShowOnboarding: boolean;
+}
+
 interface HostStatus {
   connected: boolean;
   protocolVersion: string;
@@ -108,6 +118,16 @@ const DEFAULT_HOST_STATUS: HostStatus = {
   connected: false,
   protocolVersion: 'IPC v1',
   lastError: null,
+};
+
+const DEFAULT_PERMISSION_STATUS: PermissionStatus = {
+  currentOrigin: '',
+  currentOriginPattern: '',
+  currentOriginGranted: false,
+  canRequestCurrentOrigin: false,
+  hasAllUrlsPermission: false,
+  grantedOrigins: [],
+  shouldShowOnboarding: false,
 };
 
 const DEFAULT_HOST_STATS: HostStats = {
@@ -244,6 +264,34 @@ function normalizeHostStatus(status: Partial<HostStatus> | undefined): HostStatu
   };
 }
 
+function normalizeGrantedOrigins(origins: unknown) {
+  if (!Array.isArray(origins)) {
+    return [] as string[];
+  }
+
+  return Array.from(new Set(origins.map((origin) => String(origin || '').trim()).filter(Boolean))).sort((left, right) => {
+    if (left === '<all_urls>') {
+      return -1;
+    }
+    if (right === '<all_urls>') {
+      return 1;
+    }
+    return left.localeCompare(right);
+  });
+}
+
+function normalizePermissionStatus(status: Partial<PermissionStatus> | undefined): PermissionStatus {
+  return {
+    currentOrigin: typeof status?.currentOrigin === 'string' ? status.currentOrigin : DEFAULT_PERMISSION_STATUS.currentOrigin,
+    currentOriginPattern: typeof status?.currentOriginPattern === 'string' ? status.currentOriginPattern : DEFAULT_PERMISSION_STATUS.currentOriginPattern,
+    currentOriginGranted: typeof status?.currentOriginGranted === 'boolean' ? status.currentOriginGranted : DEFAULT_PERMISSION_STATUS.currentOriginGranted,
+    canRequestCurrentOrigin: typeof status?.canRequestCurrentOrigin === 'boolean' ? status.canRequestCurrentOrigin : DEFAULT_PERMISSION_STATUS.canRequestCurrentOrigin,
+    hasAllUrlsPermission: typeof status?.hasAllUrlsPermission === 'boolean' ? status.hasAllUrlsPermission : DEFAULT_PERMISSION_STATUS.hasAllUrlsPermission,
+    grantedOrigins: normalizeGrantedOrigins(status?.grantedOrigins),
+    shouldShowOnboarding: typeof status?.shouldShowOnboarding === 'boolean' ? status.shouldShowOnboarding : DEFAULT_PERMISSION_STATUS.shouldShowOnboarding,
+  };
+}
+
 function normalizeHostStats(stats: Partial<HostStats> | undefined): HostStats {
   return {
     globalSpeedBytesPerSecond: Number.isFinite(Number(stats?.globalSpeedBytesPerSecond))
@@ -356,6 +404,10 @@ function formatDetectedTimestamp(value: number | undefined) {
   return timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+function formatGrantedOrigin(origin: string) {
+  return origin === '<all_urls>' ? 'All sites (<all_urls>)' : origin;
+}
+
 function getDownloadParentDirectory(outputPath: string | undefined) {
   if (!outputPath) {
     return '';
@@ -371,6 +423,7 @@ function getDownloadParentDirectory(outputPath: string | undefined) {
 
 export default function App({ surface = 'dashboard' }: AppProps) {
   const isOptionsSurface = surface === 'options';
+  const isPopupSurface = surface === 'popup';
   const [downloads, setDownloads] = useState<DownloadItem[]>([]);
   const [activeTab, setActiveTab] = useState<'all' | 'active' | 'finished' | 'grabber'>('all');
   const [isAdding, setIsAdding] = useState(false);
@@ -387,6 +440,8 @@ export default function App({ surface = 'dashboard' }: AppProps) {
   const [hostStatus, setHostStatus] = useState<HostStatus>(DEFAULT_HOST_STATUS);
   const [hostStats, setHostStats] = useState<HostStats>(DEFAULT_HOST_STATS);
   const [hostSettings, setHostSettings] = useState<HostSettings>(DEFAULT_HOST_SETTINGS);
+  const [permissionStatus, setPermissionStatus] = useState<PermissionStatus>(DEFAULT_PERMISSION_STATUS);
+  const [permissionNotice, setPermissionNotice] = useState<string | null>(null);
   const [detectedStreams, setDetectedStreams] = useState<DetectedStreamItem[]>([]);
   const [grabberNotice, setGrabberNotice] = useState<string | null>(null);
   const [isScanningPage, setIsScanningPage] = useState(false);
@@ -542,6 +597,21 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     setHostStats(normalizeHostStats(stats));
   };
 
+  const refreshPermissionStatus = async () => {
+    if (!isExtensionRuntimeAvailable()) {
+      setPermissionStatus(DEFAULT_PERMISSION_STATUS);
+      return;
+    }
+
+    const response = await sendExtensionMessage<{ status?: PermissionStatus; error?: string }>({ type: 'GET_PERMISSION_STATUS' });
+    if (response?.error) {
+      setPermissionNotice(response.error);
+      return;
+    }
+    setPermissionNotice(null);
+    setPermissionStatus(normalizePermissionStatus(response?.status));
+  };
+
   const refreshDownloads = async () => {
     if (isExtensionRuntimeAvailable()) {
       await sendExtensionMessage({ type: 'GET_DOWNLOADS' });
@@ -623,6 +693,8 @@ export default function App({ surface = 'dashboard' }: AppProps) {
           applyHostSettings(message.payload || {});
         } else if (message.type === 'HOST_STATUS') {
           setHostStatus(normalizeHostStatus(message.payload));
+        } else if (message.type === 'PERMISSIONS_UPDATED') {
+          setPermissionStatus(normalizePermissionStatus(message.payload));
         } else if (message.type === 'DETECTED_STREAMS_UPDATED') {
           void refreshDetectedStreams();
         }
@@ -632,6 +704,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
       void refreshDownloads();
       void refreshHostStatus();
       void refreshHostStats();
+      void refreshPermissionStatus();
       void refreshDetectedStreams();
 
       const interval = window.setInterval(() => {
@@ -722,6 +795,69 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     }
 
     window.open('/options.html', '_blank', 'noopener,noreferrer');
+  };
+
+  const requestAllUrlsPermission = async () => {
+    if (!isExtensionRuntimeAvailable()) {
+      return;
+    }
+
+    const response = await sendExtensionMessage<{ granted?: boolean; status?: PermissionStatus; error?: string }>({ type: 'REQUEST_ALL_URLS_PERMISSION' });
+    if (response?.error) {
+      setPermissionNotice(response.error);
+      return;
+    }
+    if (response?.status) {
+      setPermissionStatus(normalizePermissionStatus(response.status));
+    }
+    setPermissionNotice(response?.granted ? null : 'All-sites access not granted. Per-origin access still works.');
+  };
+
+  const dismissPermissionOnboarding = async () => {
+    if (!isExtensionRuntimeAvailable()) {
+      return;
+    }
+
+    const response = await sendExtensionMessage<{ status?: PermissionStatus; error?: string }>({ type: 'DISMISS_PERMISSION_ONBOARDING' });
+    if (response?.error) {
+      setPermissionNotice(response.error);
+      return;
+    }
+    setPermissionNotice(null);
+    setPermissionStatus(normalizePermissionStatus(response?.status));
+  };
+
+  const requestCurrentOriginPermission = async () => {
+    if (!isExtensionRuntimeAvailable()) {
+      return;
+    }
+
+    const response = await sendExtensionMessage<{ granted?: boolean; status?: PermissionStatus; error?: string }>({ type: 'REQUEST_CURRENT_TAB_PERMISSION' });
+    if (response?.error) {
+      setPermissionNotice(response.error);
+      return;
+    }
+    if (response?.status) {
+      setPermissionStatus(normalizePermissionStatus(response.status));
+    }
+    setPermissionNotice(response?.granted ? null : 'Current tab access not granted.');
+  };
+
+  const revokeGrantedPermission = async (origin: string) => {
+    if (!isExtensionRuntimeAvailable()) {
+      return;
+    }
+
+    const response = await sendExtensionMessage<{ status?: PermissionStatus; error?: string }>({
+      type: 'REVOKE_GRANTED_PERMISSION',
+      origin,
+    });
+    if (response?.error) {
+      setPermissionNotice(response.error);
+      return;
+    }
+    setPermissionNotice(null);
+    setPermissionStatus(normalizePermissionStatus(response?.status));
   };
 
   const openLogs = async () => {
@@ -1307,6 +1443,51 @@ export default function App({ surface = 'dashboard' }: AppProps) {
               className="w-full bg-[#0A0A0A] border border-white/10 px-4 py-3 rounded-xl font-mono text-[13px] text-white focus:outline-none focus:border-white/30 transition-colors resize-y min-h-28"
             />
           </div>
+
+          {isOptionsSurface && (
+            <div className="space-y-4 sm:col-span-2 rounded-2xl border border-white/10 bg-white/2 p-4">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <label className="text-[13px] font-medium tracking-wide text-white/90">Granted Origin Permissions</label>
+                  <p className="text-[10px] uppercase font-mono mt-1 tracking-wider text-white/40">Optional host permissions currently granted to the extension</p>
+                </div>
+                {!permissionStatus.hasAllUrlsPermission && (
+                  <button
+                    type="button"
+                    onClick={() => void requestAllUrlsPermission()}
+                    className="rounded-lg border border-white/10 px-3 py-1.5 text-[11px] uppercase tracking-wider text-white/60 transition-colors hover:border-white/20 hover:text-white/85"
+                  >
+                    Grant All Sites
+                  </button>
+                )}
+              </div>
+
+              {permissionNotice && <p className="text-[11px] text-amber-200">{permissionNotice}</p>}
+
+              {permissionStatus.grantedOrigins.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-white/10 bg-[#0A0A0A] px-4 py-4 text-sm text-white/55">
+                  No optional origins granted yet.
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {permissionStatus.grantedOrigins.map((origin) => (
+                    <div key={origin} className="flex items-center justify-between gap-4 rounded-xl border border-white/10 bg-[#0A0A0A] px-4 py-3">
+                      <div className="min-w-0 text-sm text-white/80">
+                        <div className="truncate" title={origin}>{formatGrantedOrigin(origin)}</div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void revokeGrantedPermission(origin)}
+                        className="rounded-lg border border-red-500/20 px-3 py-1.5 text-[11px] uppercase tracking-wider text-red-200 transition-colors hover:bg-red-500/10"
+                      >
+                        Revoke
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </>
@@ -1503,6 +1684,35 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     </div>
   );
 
+  const permissionOnboardingCard = isPopupSurface && permissionStatus.shouldShowOnboarding && !permissionStatus.hasAllUrlsPermission ? (
+    <div className="border-b border-white/5 px-6 py-4 bg-[#0A0A0A]/95 backdrop-blur-md">
+      <div className="rounded-2xl border border-white/10 bg-white/2 p-4">
+        <p className="text-[10px] uppercase tracking-widest font-mono text-white/40">Permission Setup</p>
+        <h2 className="mt-2 text-sm font-semibold text-white">Detection works best with optional site access</h2>
+        <p className="mt-2 text-sm leading-6 text-white/60">
+          Grant all-sites access once to let webRequest detection see manifests across origins. You can still use per-origin access from footer CTA if you want tighter scope.
+        </p>
+        {permissionNotice && <p className="mt-3 text-[11px] text-amber-200">{permissionNotice}</p>}
+        <div className="mt-4 flex gap-3">
+          <button
+            type="button"
+            onClick={() => void requestAllUrlsPermission()}
+            className="rounded-xl bg-white px-4 py-2 text-[11px] font-mono uppercase tracking-widest text-black transition-colors hover:bg-white/90"
+          >
+            Grant All Sites
+          </button>
+          <button
+            type="button"
+            onClick={() => void dismissPermissionOnboarding()}
+            className="rounded-xl border border-white/10 px-4 py-2 text-[11px] font-mono uppercase tracking-widest text-white/70 transition-colors hover:border-white/20 hover:text-white"
+          >
+            Not Now
+          </button>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
   return (
     <div className="flex h-screen overflow-hidden bg-[#0A0A0A] text-[#EDEDED]">
       <aside className="w-64 border-r border-white/5 flex flex-col bg-white/[0.02] backdrop-blur-xl">
@@ -1561,6 +1771,8 @@ export default function App({ surface = 'dashboard' }: AppProps) {
             </div>
           </div>
         </header>
+
+        {permissionOnboardingCard}
 
         <div className="flex-1 overflow-auto relative">
           {activeTab === 'grabber' ? grabberPanel : (
@@ -1708,7 +1920,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
           )}
         </div>
 
-        <footer className="h-8 border-t border-white/5 bg-[#0A0A0A] text-white/40 px-6 flex items-center justify-between text-[10px] font-mono uppercase tracking-widest gap-4">
+        <footer className="min-h-8 border-t border-white/5 bg-[#0A0A0A] text-white/40 px-6 py-2 flex items-center justify-between text-[10px] font-mono uppercase tracking-widest gap-4 flex-wrap">
           <div>
             Native Host:{' '}
             <span className={hostStatus.connected ? 'text-green-400' : 'text-amber-300'}>
@@ -1716,6 +1928,16 @@ export default function App({ surface = 'dashboard' }: AppProps) {
             </span>
           </div>
           <div>Queue: Default (Parallel x{segmentsCount})</div>
+          {isPopupSurface && permissionStatus.canRequestCurrentOrigin && !permissionStatus.currentOriginGranted && !permissionStatus.hasAllUrlsPermission && (
+            <button
+              type="button"
+              onClick={() => void requestCurrentOriginPermission()}
+              className="max-w-65 truncate rounded-md border border-white/10 px-2 py-1 text-white/70 transition-colors hover:border-white/20 hover:text-white"
+              title={`Grant access to ${permissionStatus.currentOrigin}`}
+            >
+              Grant access to {permissionStatus.currentOrigin}
+            </button>
+          )}
           <div>Active Connections: {activeConnections}</div>
         </footer>
       </main>
