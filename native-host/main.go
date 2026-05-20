@@ -192,6 +192,22 @@ func main() {
 			} else {
 				resp.Status = "ok"
 			}
+		case "download.remove":
+			var params struct {
+				ID         string `json:"id"`
+				DeleteFile bool   `json:"deleteFile"`
+			}
+			if err := decodeParams(req, &params); err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+				break
+			}
+			if err := engine.Remove(params.ID, params.DeleteFile); err != nil {
+				resp.Status = "error"
+				resp.Message = err.Error()
+			} else {
+				resp.Status = "ok"
+			}
 		case "download.resumeAll":
 			list, err := storage.ListDownloads()
 			if err != nil {

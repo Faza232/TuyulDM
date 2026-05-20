@@ -128,6 +128,16 @@ func (s *Storage) SaveDownload(d *DownloadState) error {
 	})
 }
 
+func (s *Storage) DeleteDownload(id string) error {
+	return s.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(bucketName))
+		if b.Get([]byte(id)) == nil {
+			return fmt.Errorf("download not found")
+		}
+		return b.Delete([]byte(id))
+	})
+}
+
 func (s *Storage) GetDownload(id string) (*DownloadState, error) {
 	var d DownloadState
 	err := s.db.View(func(tx *bbolt.Tx) error {

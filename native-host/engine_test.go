@@ -307,6 +307,167 @@ func TestEngineUpdateHostSettingsPersistsAndRebalancesSlots(t *testing.T) {
 	}
 }
 
+func TestEngineRemoveQueuedDownloadDeletesRecordAndQueueEntry(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	state := &DownloadState{
+		ID:        "queued-remove",
+		Filename:  "queued.bin",
+		OutputPath: filepath.Join(t.TempDir(), "queued.bin"),
+		Status:    "queued",
+		Type:      "file",
+		CreatedAt: time.Now(),
+	}
+	if err := storage.SaveDownload(state); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+
+	engine.mu.Lock()
+	engine.queued = append(engine.queued, state.ID)
+	engine.queuedSet[state.ID] = struct{}{}
+	engine.mu.Unlock()
+
+	if err := engine.Remove(state.ID, false); err != nil {
+		t.Fatalf("Remove returned error: %v", err)
+	}
+	if _, err := storage.GetDownload(state.ID); err == nil {
+		t.Fatal("expected queued download to be removed from storage")
+	}
+
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if len(engine.queued) != 0 {
+		t.Fatalf("expected queued list to be empty, got %v", engine.queued)
+	}
+	if _, ok := engine.queuedSet[state.ID]; ok {
+		t.Fatal("expected queuedSet entry to be removed")
+	}
+}
+
+func TestEngineRemoveFinishedDownloadDeletesFile(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	outputPath := filepath.Join(t.TempDir(), "finished.bin")
+	if err := os.WriteFile(outputPath, []byte("done"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	state := &DownloadState{
+		ID:         "finished-remove",
+		Filename:   filepath.Base(outputPath),
+		OutputPath: outputPath,
+		Status:     "finished",
+		Type:       "file",
+		CreatedAt:  time.Now(),
+	}
+	if err := storage.SaveDownload(state); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+
+	if err := engine.Remove(state.ID, true); err != nil {
+		t.Fatalf("Remove returned error: %v", err)
+	}
+	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
+		t.Fatalf("expected output file to be deleted, got err=%v", err)
+	}
+	if _, err := storage.GetDownload(state.ID); err == nil {
+		t.Fatal("expected finished download to be removed from storage")
+	}
+}
+
+func TestEngineRemoveVideoDownloadCleansSegmentDir(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	outputPath := filepath.Join(t.TempDir(), "video.mp4")
+	segmentDir := filepath.Join(filepath.Dir(outputPath), ".segments", "video-remove")
+	if err := os.MkdirAll(segmentDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	partPath := filepath.Join(segmentDir, "0000.part")
+	if err := os.WriteFile(partPath, []byte("partial"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	state := &DownloadState{
+		ID:         "video-remove",
+		Filename:   filepath.Base(outputPath),
+		OutputPath: outputPath,
+		Status:     "paused",
+		Type:       "video",
+		CreatedAt:  time.Now(),
+	}
+	if err := storage.SaveDownload(state); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+
+	if err := engine.Remove(state.ID, false); err != nil {
+		t.Fatalf("Remove returned error: %v", err)
+	}
+	if _, err := os.Stat(segmentDir); !os.IsNotExist(err) {
+		t.Fatalf("expected segment dir to be deleted, got err=%v", err)
+	}
+}
+
+func TestEngineRemoveActiveDownloadWaitsForCancellation(t *testing.T) {
+	t.Setenv("XDG_DOWNLOAD_DIR", filepath.Join(t.TempDir(), "downloads"))
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	requestStarted := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", "1024")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Header.Get("Range") != "" {
+			w.Header().Set("Content-Range", "bytes 0-0/1024")
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("x"))
+			return
+		}
+		requestStarted <- struct{}{}
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(DownloadRequest{URL: server.URL + "/active.bin", Filename: "active.bin", Segments: 1})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if err := engine.Start(state.ID); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for active request")
+	}
+
+	removeDone := make(chan error, 1)
+	go func() {
+		removeDone <- engine.Remove(state.ID, false)
+	}()
+
+	select {
+	case err := <-removeDone:
+		if err != nil {
+			t.Fatalf("Remove returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Remove to finish")
+	}
+
+	if _, err := storage.GetDownload(state.ID); err == nil {
+		t.Fatal("expected active download to be removed from storage")
+	}
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if _, ok := engine.active[state.ID]; ok {
+		t.Fatal("expected active download entry to be removed")
+	}
+}
+
 func TestEngineAddPersistsSchedule(t *testing.T) {
 	storage := newTestStorage(t)
 	engine := NewEngine(storage, nil)

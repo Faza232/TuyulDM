@@ -363,6 +363,8 @@ export default function App({ surface = 'dashboard' }: AppProps) {
   const [hostSettings, setHostSettings] = useState<HostSettings>(DEFAULT_HOST_SETTINGS);
   const [downloadDirInput, setDownloadDirInput] = useState(DEFAULT_HOST_SETTINGS.downloadDir);
   const [downloadDirError, setDownloadDirError] = useState<string | null>(null);
+  // TODO: extend single-item removal flow to multi-select actions.
+  const [removalTarget, setRemovalTarget] = useState<{ id: number | string; status: DownloadItem['status'] } | null>(null);
   const [scheduleEnabled, setScheduleEnabled] = useState(false);
   const [scheduleStartHour, setScheduleStartHour] = useState(2);
   const [scheduleEndHour, setScheduleEndHour] = useState(6);
@@ -681,6 +683,32 @@ export default function App({ surface = 'dashboard' }: AppProps) {
     if (response?.error) {
       console.error('Failed to open host logs:', response.error);
     }
+  };
+
+  const removeDownload = async (id: number | string, deleteFile: boolean) => {
+    setRemovalTarget(null);
+
+    if (isExtensionRuntimeAvailable()) {
+      const response = await sendExtensionMessage<{ error?: string }>({
+        type: 'REMOVE_DOWNLOAD',
+        id,
+        deleteFile,
+      });
+
+      if (response?.error) {
+        console.error('Failed to remove download:', response.error);
+      }
+      void refreshDownloads();
+      void refreshHostStats();
+      return;
+    }
+
+    await fetch(`/api/downloads/${id}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deleteFile }),
+    });
+    await refreshPreviewData();
   };
 
   const commitDownloadDir = async () => {
@@ -1326,7 +1354,7 @@ export default function App({ surface = 'dashboard' }: AppProps) {
                     </div>
                   </div>
                   <div className="data-value">{download.speed}</div>
-                  <div className="flex gap-2">
+                  <div className="relative flex gap-2">
                     <button
                       onClick={() => void togglePlayPause(download.id, download.status)}
                       className="p-1.5 text-white/40 hover:text-white hover:bg-white/10 rounded-md transition-all"
@@ -1340,9 +1368,43 @@ export default function App({ surface = 'dashboard' }: AppProps) {
                         <Play className="w-3.5 h-3.5 pl-[1px]" />
                       )}
                     </button>
-                    <button className="p-1.5 text-white/40 hover:text-red-400 hover:bg-red-400/10 rounded-md transition-all">
+                    <button
+                      type="button"
+                      onClick={() => setRemovalTarget((current) => current?.id === download.id ? null : { id: download.id, status: download.status })}
+                      className="p-1.5 text-white/40 hover:text-red-400 hover:bg-red-400/10 rounded-md transition-all"
+                      title="Remove download"
+                    >
                       <X className="w-3.5 h-3.5" />
                     </button>
+                    {removalTarget?.id === download.id && (
+                      <div className="absolute right-0 top-full z-20 mt-2 w-56 rounded-xl border border-white/10 bg-[#111111] p-3 shadow-2xl">
+                        <p className="text-[11px] font-medium text-white/85">Remove this download?</p>
+                        <p className="mt-1 text-[10px] text-white/45">List entry removed now. Delete file also removes any partial data.</p>
+                        <div className="mt-3 space-y-2">
+                          <button
+                            type="button"
+                            onClick={() => void removeDownload(download.id, false)}
+                            className="w-full rounded-lg border border-white/10 px-3 py-2 text-left text-[11px] text-white/75 transition-colors hover:border-white/20 hover:text-white"
+                          >
+                            Remove from list
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void removeDownload(download.id, true)}
+                            className={`w-full rounded-lg px-3 py-2 text-left text-[11px] transition-colors ${removalTarget.status === 'finished' ? 'bg-red-500/15 text-red-200 hover:bg-red-500/20' : 'border border-red-500/25 text-red-200 hover:bg-red-500/10'}`}
+                          >
+                            Remove from list and delete file
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setRemovalTarget(null)}
+                            className="w-full rounded-lg px-3 py-2 text-left text-[11px] text-white/45 transition-colors hover:bg-white/5 hover:text-white/75"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </motion.div>
               ))}

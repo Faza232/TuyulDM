@@ -663,6 +663,20 @@ browserApi.runtime.onMessage.addListener(((message: any, _sender: any, sendRespo
     return false;
   }
 
+  if (message.type === 'REMOVE_DOWNLOAD') {
+    sendHostRequest('download.remove', {
+      id: String(message.id),
+      deleteFile: !!message.deleteFile,
+    })
+      .then(() => {
+        activeDownloads.delete(String(message.id));
+        return sendHostRequest('download.list');
+      })
+      .then(() => sendResponse({ ok: true, status: hostStatus }))
+      .catch((error) => sendResponse({ error: String(error), status: hostStatus }));
+    return true;
+  }
+
   if (message.type === 'PAUSE_ALL_DOWNLOADS') {
     void sendHostRequest('download.pauseAll')
       .then(() => sendHostRequest('download.list'))

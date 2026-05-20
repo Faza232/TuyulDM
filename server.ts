@@ -93,6 +93,18 @@ async function startServer() {
     res.json(dl || {});
   });
 
+  app.delete("/api/downloads/:id", (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    const index = activeDownloads.findIndex((download) => download.id === id);
+    if (index === -1) {
+      res.status(404).json({ error: "download not found" });
+      return;
+    }
+
+    const [removed] = activeDownloads.splice(index, 1);
+    res.json({ ok: true, removed, deleteFile: !!req.body?.deleteFile });
+  });
+
   app.post("/api/downloads/pause-all", (_req, res) => {
     activeDownloads.forEach((download) => {
       if (download.status === "downloading" || download.status === "queued" || download.status === "muxing") {

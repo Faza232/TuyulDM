@@ -175,6 +175,7 @@ type ActiveDownload struct {
 	State              *DownloadState
 	Ctx                context.Context
 	Cancel             context.CancelFunc
+	Done               chan struct{}
 	File               *os.File
 	PerDownloadLimiter *rate.Limiter
 	mu                 sync.Mutex
@@ -321,6 +322,8 @@ func (e *Engine) Start(id string) error {
 }
 
 func (e *Engine) runDownload(a *ActiveDownload) {
+	defer close(a.Done)
+
 	file, err := os.OpenFile(downloadPath(a.State), os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		e.failDownload(a, err)
@@ -668,6 +671,89 @@ func (e *Engine) Resume(id string) error {
 	}
 
 	return e.Start(id)
+}
+
+func (e *Engine) Remove(id string, deleteFile bool) error {
+	state, err := e.storage.GetDownload(id)
+	if err != nil {
+		return err
+	}
+
+	active := e.detachQueuedDownload(id)
+	if active != nil {
+		active.Cancel()
+		<-active.Done
+
+		updatedState, updatedErr := e.storage.GetDownload(id)
+		if updatedErr == nil {
+			state = updatedState
+		}
+	}
+
+	if deleteFile {
+		if err := removeDownloadOutputFile(state); err != nil {
+			return err
+		}
+	}
+	if err := e.removeVideoArtifacts(state); err != nil {
+		return err
+	}
+	if err := e.storage.DeleteDownload(id); err != nil {
+		return err
+	}
+
+	slog.Info("download removed",
+		"download_id", state.ID,
+		"status", state.Status,
+		"delete_file", deleteFile,
+		"output_path", state.OutputPath,
+	)
+	return nil
+}
+
+func (e *Engine) detachQueuedDownload(id string) *ActiveDownload {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if _, ok := e.queuedSet[id]; ok {
+		delete(e.queuedSet, id)
+		for index, queuedID := range e.queued {
+			if queuedID == id {
+				e.queued = append(e.queued[:index], e.queued[index+1:]...)
+				break
+			}
+		}
+	}
+
+	if active, ok := e.active[id]; ok {
+		return active
+	}
+	return nil
+}
+
+func removeDownloadOutputFile(state *DownloadState) error {
+	path := strings.TrimSpace(downloadPath(state))
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func (e *Engine) removeVideoArtifacts(state *DownloadState) error {
+	if state.Type != "video" {
+		return nil
+	}
+	segmentDir, err := e.videoSegmentDirPath(state)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(segmentDir); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func (e *Engine) probeDownload(downloadURL string, headers map[string]string, cookies []RequestCookie) (downloadMetadata, error) {
@@ -1223,6 +1309,7 @@ func (e *Engine) startQueuedDownload(id string) error {
 		State:              state,
 		Ctx:                ctx,
 		Cancel:             cancel,
+		Done:               make(chan struct{}),
 		PerDownloadLimiter: newRateLimiter(settings.PerDownloadThrottleBytesPerSecond),
 	}
 

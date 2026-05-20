@@ -127,6 +127,8 @@ func totalKnownSegmentBytes(segments []Segment) (int64, bool) {
 }
 
 func (e *Engine) runVideoDownload(a *ActiveDownload) {
+	defer close(a.Done)
+
 	segmentDir, err := e.videoSegmentDir(a.State)
 	if err != nil {
 		e.failDownload(a, err)
@@ -486,16 +488,26 @@ func prepareVideoSegmentFile(a *ActiveDownload, idx int, path string) (*os.File,
 }
 
 func (e *Engine) videoSegmentDir(state *DownloadState) (string, error) {
-	downloadsDir, err := ResolveDownloadDir(e.HostSettings())
+	path, err := e.videoSegmentDirPath(state)
 	if err != nil {
 		return "", err
 	}
-
-	path := filepath.Join(downloadsDir, ".segments", state.ID)
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return "", err
 	}
 	return path, nil
+}
+
+func (e *Engine) videoSegmentDirPath(state *DownloadState) (string, error) {
+	baseDir := filepath.Dir(strings.TrimSpace(downloadPath(state)))
+	if baseDir == "" || baseDir == "." {
+		downloadsDir, err := ResolveDownloadDir(e.HostSettings())
+		if err != nil {
+			return "", err
+		}
+		baseDir = downloadsDir
+	}
+	return filepath.Join(baseDir, ".segments", state.ID), nil
 }
 
 func videoSegmentPartPath(segmentDir string, index int) string {
