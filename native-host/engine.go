@@ -45,6 +45,7 @@ var forwardedHeaderAllowlist = map[string]struct{}{
 }
 
 type DownloadRequest struct {
+	ID       string            `json:"id,omitempty"`
 	URL      string            `json:"url"`
 	Filename string            `json:"filename"`
 	Segments int               `json:"segments"`
@@ -498,6 +499,13 @@ func (e *Engine) globalLimiterSnapshot() *rate.Limiter {
 	return e.globalLimiter
 }
 
+func normalizedContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
 func (e *Engine) Add(ctx context.Context, req DownloadRequest) (*DownloadState, error) {
 	if strings.TrimSpace(req.URL) == "" {
 		return nil, fmt.Errorf("url is required")
@@ -511,7 +519,10 @@ func (e *Engine) Add(ctx context.Context, req DownloadRequest) (*DownloadState, 
 		return nil, err
 	}
 
-	id := fmt.Sprintf("%d%d", os.Getpid(), time.Now().UnixNano())
+	id := strings.TrimSpace(req.ID)
+	if id == "" {
+		id = fmt.Sprintf("%d%d", os.Getpid(), time.Now().UnixNano())
+	}
 	probedAt := time.Now().UTC()
 	state := &DownloadState{
 		ID:             id,
@@ -1238,15 +1249,20 @@ func (e *Engine) completeSegment(a *ActiveDownload, idx int) error {
 	return nil
 }
 
-func (e *Engine) Pause(id string) error {
-	return e.pause(id, true)
+func (e *Engine) Pause(ctx context.Context, id string) error {
+	return e.pause(ctx, id, true)
 }
 
-func (e *Engine) pauseSystem(id string) error {
-	return e.pause(id, false)
+func (e *Engine) pauseSystem(ctx context.Context, id string) error {
+	return e.pause(ctx, id, false)
 }
 
-func (e *Engine) pause(id string, userInitiated bool) error {
+func (e *Engine) pause(ctx context.Context, id string, userInitiated bool) error {
+	ctx = normalizedContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	state, err := e.storage.GetDownload(id)
 	if err != nil {
 		return err
@@ -1292,7 +1308,12 @@ func (e *Engine) pause(id string, userInitiated bool) error {
 	return nil
 }
 
-func (e *Engine) Resume(id string) error {
+func (e *Engine) Resume(ctx context.Context, id string) error {
+	ctx = normalizedContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	state, err := e.storage.GetDownload(id)
 	if err != nil {
 		return err
@@ -1305,11 +1326,19 @@ func (e *Engine) Resume(id string) error {
 	if err := e.storage.SaveDownload(state); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	return e.Start(id)
 }
 
-func (e *Engine) RefreshURL(id string, newURL string, force bool, restartFromScratch bool) (*DownloadState, error) {
+func (e *Engine) RefreshURL(ctx context.Context, id string, newURL string, force bool, restartFromScratch bool) (*DownloadState, error) {
+	ctx = normalizedContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	trimmedURL := strings.TrimSpace(newURL)
 	if trimmedURL == "" {
 		return nil, fmt.Errorf("url is required")
@@ -1323,7 +1352,7 @@ func (e *Engine) RefreshURL(id string, newURL string, force bool, restartFromScr
 		return nil, fmt.Errorf("download must be awaiting url refresh, paused, or expired")
 	}
 
-	probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	meta, err := e.probeDownload(probeCtx, trimmedURL, cloneStringMap(state.Headers), append([]RequestCookie(nil), state.Cookies...))
@@ -1421,7 +1450,10 @@ func (e *Engine) RefreshURL(id string, newURL string, force bool, restartFromScr
 	if err := e.storage.SaveDownload(state); err != nil {
 		return nil, err
 	}
-	if err := e.Resume(state.ID); err != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := e.Resume(ctx, state.ID); err != nil {
 		return nil, err
 	}
 
@@ -1449,7 +1481,12 @@ func resetSegmentsForRetry(state *DownloadState) {
 	setDownloadSpeed(state, 0)
 }
 
-func (e *Engine) Remove(id string, deleteFile bool) error {
+func (e *Engine) Remove(ctx context.Context, id string, deleteFile bool) error {
+	ctx = normalizedContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	state, err := e.storage.GetDownload(id)
 	if err != nil {
 		return err
@@ -1458,7 +1495,11 @@ func (e *Engine) Remove(id string, deleteFile bool) error {
 	active := e.detachQueuedDownload(id)
 	if active != nil {
 		active.Cancel()
-		<-active.Done
+		select {
+		case <-active.Done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 
 		updatedState, updatedErr := e.storage.GetDownload(id)
 		if updatedErr == nil {

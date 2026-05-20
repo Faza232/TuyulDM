@@ -114,7 +114,7 @@ func TestResumeAllDownloadsIgnoresPausedAlreadyActiveRace(t *testing.T) {
 	}
 	engine.mu.Unlock()
 
-	if err := resumeAllDownloads(engine, []DownloadState{{ID: state.ID, Status: "paused"}}); err != nil {
+	if err := resumeAllDownloads(context.Background(), engine, []DownloadState{{ID: state.ID, Status: "paused"}}); err != nil {
 		t.Fatalf("resumeAllDownloads returned error: %v", err)
 	}
 

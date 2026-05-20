@@ -7,8 +7,8 @@ import (
 )
 
 type schedulerController interface {
-	pauseSystem(id string) error
-	Resume(id string) error
+	pauseSystem(ctx context.Context, id string) error
+	Resume(ctx context.Context, id string) error
 }
 
 type downloadScheduler struct {
@@ -59,13 +59,13 @@ func (scheduler *downloadScheduler) reconcileDownload(download *DownloadState, n
 	if !downloadScheduleAllows(download.Schedule, now) {
 		switch download.Status {
 		case "downloading", "muxing", "queued":
-			return scheduler.controller.pauseSystem(download.ID)
+			return scheduler.controller.pauseSystem(context.Background(), download.ID)
 		}
 		return nil
 	}
 
 	if download.Status == "paused" && !download.WasUserPaused {
-		if err := scheduler.controller.Resume(download.ID); err != nil && err.Error() != "already active" {
+		if err := scheduler.controller.Resume(context.Background(), download.ID); err != nil && err.Error() != "already active" {
 			return err
 		}
 	}

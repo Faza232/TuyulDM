@@ -1026,6 +1026,13 @@ function sendHostRequest(method: string, params: Record<string, unknown> = {}) {
   });
 }
 
+function createDownloadRequestId() {
+  if (typeof crypto?.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `download-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 async function interceptDownload(item: any) {
   if (item.byExtensionId === browser.runtime.id) {
     return;
@@ -1045,6 +1052,7 @@ async function interceptDownload(item: any) {
   const requestContext = await buildForwardedRequestContext(item.url, item.referrer);
   try {
     await sendHostRequest('download.add', {
+      id: createDownloadRequestId(),
       url: item.url,
       filename: getDownloadFilename(item),
       schedule: buildInterceptionSchedule(settings),
@@ -1078,6 +1086,7 @@ async function startDetectedMediaDownload(tabId: number, entryId: string, select
   if (entry.kind === 'progressive_mp4') {
     const fileExtension = getFileExtension(entry.url) || (entry.label.toLowerCase().includes('webm') ? 'webm' : 'mp4');
     await sendHostRequest('download.add', {
+      id: createDownloadRequestId(),
       url: entry.url,
       filename: `Media_${Date.now()}.${fileExtension}`,
       schedule: buildInterceptionSchedule(settings),
@@ -1423,6 +1432,7 @@ browserApi.runtime.onMessage.addListener(((message: any, sender: any, sendRespon
         };
       })
       .then((requestContext) => sendHostRequest('download.add', {
+        id: createDownloadRequestId(),
         url: message.url,
         filename,
         segments: message.segments || 8,

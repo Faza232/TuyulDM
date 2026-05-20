@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -37,6 +39,61 @@ type readLoopResult struct {
 	err     error
 }
 
+type pendingDownloadRequest struct {
+	cancel context.CancelFunc
+}
+
+type pendingDownloadRequests struct {
+	mu   sync.Mutex
+	byID map[string]*pendingDownloadRequest
+}
+
+func newPendingDownloadRequests() *pendingDownloadRequests {
+	return &pendingDownloadRequests{byID: make(map[string]*pendingDownloadRequest)}
+}
+
+func (pending *pendingDownloadRequests) register(id string, cancel context.CancelFunc) func() {
+	trimmedID := strings.TrimSpace(id)
+	if trimmedID == "" || cancel == nil {
+		return func() {}
+	}
+
+	entry := &pendingDownloadRequest{cancel: cancel}
+	pending.mu.Lock()
+	pending.byID[trimmedID] = entry
+	pending.mu.Unlock()
+
+	return func() {
+		pending.mu.Lock()
+		if pending.byID[trimmedID] == entry {
+			delete(pending.byID, trimmedID)
+		}
+		pending.mu.Unlock()
+	}
+}
+
+func (pending *pendingDownloadRequests) cancel(id string) bool {
+	trimmedID := strings.TrimSpace(id)
+	if trimmedID == "" {
+		return false
+	}
+
+	pending.mu.Lock()
+	entry, ok := pending.byID[trimmedID]
+	if ok {
+		delete(pending.byID, trimmedID)
+	}
+	pending.mu.Unlock()
+	if ok {
+		entry.cancel()
+	}
+	return ok
+}
+
+func isDownloadNotFoundError(err error) bool {
+	return err != nil && err.Error() == "download not found"
+}
+
 func errorResponsePayload(err error) interface{} {
 	var coded *codedError
 	if !errors.As(err, &coded) {
@@ -56,6 +113,20 @@ func main() {
 	slog.Info("native host starting")
 	hostCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
+	pendingRequests := newPendingDownloadRequests()
+	var writeMu sync.Mutex
+	writeResponse := func(resp Response) bool {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+
+		out, _ := json.Marshal(resp)
+		if err := WriteMessage(os.Stdout, out); err != nil {
+			slog.Error("write message failed", "error", err, "request_id", resp.ID)
+			stopSignals()
+			return false
+		}
+		return true
+	}
 
 	dataDir, err := DataDir()
 	if err != nil {
@@ -87,8 +158,7 @@ func main() {
 			Payload: state,
 			ID:      0, // Event messages can have ID 0
 		}
-		out, _ := json.Marshal(msg)
-		WriteMessage(os.Stdout, out)
+		writeResponse(msg)
 	})
 	if err := storage.PauseActiveDownloads(); err != nil {
 		slog.Warn("pause stale downloads failed", "error", err)
@@ -113,7 +183,7 @@ func main() {
 	}()
 
 	shutdownReason := "stdin closed"
-	readLoop:
+readLoop:
 	for {
 		select {
 		case <-hostCtx.Done():
@@ -139,347 +209,387 @@ func main() {
 
 			var resp Response
 			resp.ID = req.ID
+			dispatchAsync := func(pendingID string, handler func(context.Context) Response) {
+				requestCtx, cancel := context.WithCancel(hostCtx)
+				unregister := pendingRequests.register(pendingID, cancel)
+				go func() {
+					defer cancel()
+					defer unregister()
+					writeResponse(handler(requestCtx))
+				}()
+			}
 
 			switch req.Method {
-		case "ping":
-			resp.Status = "ok"
-			resp.Message = "pong"
-		case "video.inspect":
-			var params VideoDownloadRequest
-			if err := decodeParams(req, &params); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-			requestCtx, cancel := context.WithCancel(hostCtx)
-			preview, err := previewVideoManifest(requestCtx, params)
-			cancel()
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else {
+			case "ping":
 				resp.Status = "ok"
-				resp.Payload = preview
-			}
-		case "download.add":
-			var params DownloadRequest
-			if err := decodeParams(req, &params); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-			requestCtx, cancel := context.WithCancel(hostCtx)
-			state, err := engine.Add(requestCtx, params)
-			cancel()
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else {
-				resp.Status = "ok"
-				resp.Payload = state
-				// Auto-start for now
-				engine.Start(state.ID)
-			}
-		case "download.video":
-			var params VideoDownloadRequest
-			if err := decodeParams(req, &params); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-			requestCtx, cancel := context.WithCancel(hostCtx)
-			state, err := engine.AddVideo(requestCtx, params)
-			cancel()
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else {
-				resp.Status = "ok"
-				resp.Payload = state
-				// Auto-start for now
-				engine.Start(state.ID)
-			}
-		case "download.pause":
-			var params struct {
-				ID string `json:"id"`
-			}
-			if err := decodeParams(req, &params); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-			if err := engine.Pause(params.ID); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else {
-				resp.Status = "ok"
-			}
-		case "download.pauseAll":
-			list, err := storage.ListDownloads()
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else if err := pauseAllDownloads(engine, list); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else {
-				resp.Status = "ok"
-			}
-		case "download.resume":
-			var params struct {
-				ID string `json:"id"`
-			}
-			if err := decodeParams(req, &params); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-			err := engine.Resume(params.ID)
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else {
-				resp.Status = "ok"
-			}
-		case "download.refreshUrl":
-			var params struct {
-				ID                 string `json:"id"`
-				URL                string `json:"url"`
-				Force              bool   `json:"force,omitempty"`
-				RestartFromScratch bool   `json:"restartFromScratch,omitempty"`
-			}
-			if err := decodeParams(req, &params); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-			state, err := engine.RefreshURL(params.ID, params.URL, params.Force, params.RestartFromScratch)
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				resp.Payload = errorResponsePayload(err)
-			} else {
-				resp.Status = "ok"
-				resp.Payload = state
-			}
-		case "download.remove":
-			var params struct {
-				ID         string `json:"id"`
-				DeleteFile bool   `json:"deleteFile"`
-			}
-			if err := decodeParams(req, &params); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-			if err := engine.Remove(params.ID, params.DeleteFile); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else {
-				resp.Status = "ok"
-			}
-		case "download.resumeAll":
-			list, err := storage.ListDownloads()
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else if err := resumeAllDownloads(engine, list); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else {
-				resp.Status = "ok"
-			}
-		case "download.list":
-			list, _ := storage.ListDownloads()
-			resp.Status = "ok"
-			resp.Payload = list
-		case "host.getStats":
-			list, err := storage.ListDownloads()
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-
-			downloadsDir, err := ResolveDownloadDir(engine.HostSettings())
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-
-			freeSpaceBytes, err := DiskFreeBytes(downloadsDir)
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-
-			resp.Status = "ok"
-			resp.Payload = HostStatsPayload{
-				GlobalSpeedBytesPerSecond: aggregateGlobalSpeed(list),
-				FreeSpaceBytes:            freeSpaceBytes,
-				ActiveDownloads:           countActiveDownloads(list),
-			}
-		case "host.getSettings":
-			resp.Status = "ok"
-			resp.Payload = engine.HostSettings()
-		case "host.setSettings":
-			current := engine.HostSettings()
-			var params HostSettingsUpdate
-			if err := decodeParams(req, &params); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-
-			nextSettings := applyHostSettingsUpdate(current, params)
-			if err := engine.UpdateHostSettings(nextSettings); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else {
-				resp.Status = "ok"
-				resp.Payload = engine.HostSettings()
-			}
-		case "host.setThrottle":
-			current := engine.HostSettings()
-			var params struct {
-				GlobalThrottleBytesPerSecond      *int64 `json:"globalThrottleBytesPerSecond,omitempty"`
-				PerDownloadThrottleBytesPerSecond *int64 `json:"perDownloadThrottleBytesPerSecond,omitempty"`
-			}
-			if err := decodeParams(req, &params); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-
-			nextSettings := applyHostSettingsUpdate(current, HostSettingsUpdate{
-				GlobalThrottleBytesPerSecond:      params.GlobalThrottleBytesPerSecond,
-				PerDownloadThrottleBytesPerSecond: params.PerDownloadThrottleBytesPerSecond,
-			})
-			if err := engine.UpdateHostSettings(nextSettings); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else {
-				resp.Status = "ok"
-				resp.Payload = engine.HostSettings()
-			}
-		case "host.openLogs":
-			logPath, err := ensureHostLogFile()
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-			if err := openFilePath(logPath); err != nil {
-				slog.Error("open logs failed", "error", err, "path", logPath)
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else {
-				resp.Status = "ok"
-				resp.Payload = map[string]string{"path": logPath}
-			}
-		case "host.openFile":
-			var params struct {
-				ID string `json:"id"`
-			}
-			if err := decodeParams(req, &params); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-			state, err := storage.GetDownload(params.ID)
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-			outputPath, err := resolveDownloadOpenPath(state, engine.HostSettings())
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-			if err := openFilePath(outputPath); err != nil {
-				slog.Error("open download file failed", "error", err, "download_id", state.ID, "path", outputPath)
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else {
-				resp.Status = "ok"
-				resp.Payload = map[string]string{"path": outputPath}
-			}
-		case "host.revealInFolder":
-			var params struct {
-				ID string `json:"id"`
-			}
-			if err := decodeParams(req, &params); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-			state, err := storage.GetDownload(params.ID)
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-			outputPath, err := resolveDownloadRevealPath(state, engine.HostSettings())
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-			if err := revealFileInFolder(outputPath); err != nil {
-				slog.Error("reveal download file failed", "error", err, "download_id", state.ID, "path", outputPath)
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else {
-				resp.Status = "ok"
-				resp.Payload = map[string]string{"path": outputPath}
-			}
-		case "host.pickDirectory":
-			var params struct {
-				Initial string `json:"initial,omitempty"`
-			}
-			if err := decodeParams(req, &params); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-				break
-			}
-			selectedPath, err := pickDirectory(params.Initial)
-			if err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else {
-				resp.Status = "ok"
-				resp.Payload = map[string]string{"path": selectedPath}
-			}
-		case "download.getProgress":
-			var params struct {
-				ID string `json:"id"`
-			}
-			if err := decodeParams(req, &params); err != nil {
-				resp.Status = "error"
-				resp.Message = err.Error()
-			} else {
-				state, err := storage.GetDownload(params.ID)
+				resp.Message = "pong"
+			case "video.inspect":
+				var params VideoDownloadRequest
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				requestCtx, cancel := context.WithCancel(hostCtx)
+				preview, err := previewVideoManifest(requestCtx, params)
+				cancel()
+				if err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+				} else {
+					resp.Status = "ok"
+					resp.Payload = preview
+				}
+			case "download.add":
+				var params DownloadRequest
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				dispatchAsync(params.ID, func(requestCtx context.Context) Response {
+					resp := Response{ID: req.ID}
+					state, err := engine.Add(requestCtx, params)
+					if err != nil {
+						resp.Status = "error"
+						resp.Message = err.Error()
+						return resp
+					}
+					resp.Status = "ok"
+					resp.Payload = state
+					_ = engine.Start(state.ID)
+					return resp
+				})
+				continue
+			case "download.video":
+				var params VideoDownloadRequest
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				requestCtx, cancel := context.WithCancel(hostCtx)
+				state, err := engine.AddVideo(requestCtx, params)
+				cancel()
 				if err != nil {
 					resp.Status = "error"
 					resp.Message = err.Error()
 				} else {
 					resp.Status = "ok"
 					resp.Payload = state
+					// Auto-start for now
+					engine.Start(state.ID)
 				}
-			}
-		default:
-			resp.Status = "error"
-			resp.Message = "Unknown method: " + req.Method
-			slog.Warn("unknown IPC method", "method", req.Method, "request_id", req.ID)
+			case "download.pause":
+				var params struct {
+					ID string `json:"id"`
+				}
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				canceledPending := pendingRequests.cancel(params.ID)
+				requestCtx, cancel := context.WithCancel(hostCtx)
+				if err := engine.Pause(requestCtx, params.ID); err != nil {
+					if canceledPending && isDownloadNotFoundError(err) {
+						resp.Status = "ok"
+					} else {
+						resp.Status = "error"
+						resp.Message = err.Error()
+					}
+				} else {
+					resp.Status = "ok"
+				}
+				cancel()
+			case "download.pauseAll":
+				list, err := storage.ListDownloads()
+				if err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+				} else {
+					requestCtx, cancel := context.WithCancel(hostCtx)
+					err = pauseAllDownloads(requestCtx, engine, list)
+					cancel()
+					if err != nil {
+						resp.Status = "error"
+						resp.Message = err.Error()
+					} else {
+						resp.Status = "ok"
+					}
+				}
+			case "download.resume":
+				var params struct {
+					ID string `json:"id"`
+				}
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				requestCtx, cancel := context.WithCancel(hostCtx)
+				err := engine.Resume(requestCtx, params.ID)
+				cancel()
+				if err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+				} else {
+					resp.Status = "ok"
+				}
+			case "download.refreshUrl":
+				var params struct {
+					ID                 string `json:"id"`
+					URL                string `json:"url"`
+					Force              bool   `json:"force,omitempty"`
+					RestartFromScratch bool   `json:"restartFromScratch,omitempty"`
+				}
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				dispatchAsync(params.ID, func(requestCtx context.Context) Response {
+					resp := Response{ID: req.ID}
+					state, err := engine.RefreshURL(requestCtx, params.ID, params.URL, params.Force, params.RestartFromScratch)
+					if err != nil {
+						resp.Status = "error"
+						resp.Message = err.Error()
+						resp.Payload = errorResponsePayload(err)
+						return resp
+					}
+					resp.Status = "ok"
+					resp.Payload = state
+					return resp
+				})
+				continue
+			case "download.remove":
+				var params struct {
+					ID         string `json:"id"`
+					DeleteFile bool   `json:"deleteFile"`
+				}
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				canceledPending := pendingRequests.cancel(params.ID)
+				requestCtx, cancel := context.WithCancel(hostCtx)
+				if err := engine.Remove(requestCtx, params.ID, params.DeleteFile); err != nil {
+					if canceledPending && isDownloadNotFoundError(err) {
+						resp.Status = "ok"
+					} else {
+						resp.Status = "error"
+						resp.Message = err.Error()
+					}
+				} else {
+					resp.Status = "ok"
+				}
+				cancel()
+			case "download.resumeAll":
+				list, err := storage.ListDownloads()
+				if err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+				} else {
+					requestCtx, cancel := context.WithCancel(hostCtx)
+					err = resumeAllDownloads(requestCtx, engine, list)
+					cancel()
+					if err != nil {
+						resp.Status = "error"
+						resp.Message = err.Error()
+					} else {
+						resp.Status = "ok"
+					}
+				}
+			case "download.list":
+				list, _ := storage.ListDownloads()
+				resp.Status = "ok"
+				resp.Payload = list
+			case "host.getStats":
+				list, err := storage.ListDownloads()
+				if err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+
+				downloadsDir, err := ResolveDownloadDir(engine.HostSettings())
+				if err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+
+				freeSpaceBytes, err := DiskFreeBytes(downloadsDir)
+				if err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+
+				resp.Status = "ok"
+				resp.Payload = HostStatsPayload{
+					GlobalSpeedBytesPerSecond: aggregateGlobalSpeed(list),
+					FreeSpaceBytes:            freeSpaceBytes,
+					ActiveDownloads:           countActiveDownloads(list),
+				}
+			case "host.getSettings":
+				resp.Status = "ok"
+				resp.Payload = engine.HostSettings()
+			case "host.setSettings":
+				current := engine.HostSettings()
+				var params HostSettingsUpdate
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+
+				nextSettings := applyHostSettingsUpdate(current, params)
+				if err := engine.UpdateHostSettings(nextSettings); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+				} else {
+					resp.Status = "ok"
+					resp.Payload = engine.HostSettings()
+				}
+			case "host.setThrottle":
+				current := engine.HostSettings()
+				var params struct {
+					GlobalThrottleBytesPerSecond      *int64 `json:"globalThrottleBytesPerSecond,omitempty"`
+					PerDownloadThrottleBytesPerSecond *int64 `json:"perDownloadThrottleBytesPerSecond,omitempty"`
+				}
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+
+				nextSettings := applyHostSettingsUpdate(current, HostSettingsUpdate{
+					GlobalThrottleBytesPerSecond:      params.GlobalThrottleBytesPerSecond,
+					PerDownloadThrottleBytesPerSecond: params.PerDownloadThrottleBytesPerSecond,
+				})
+				if err := engine.UpdateHostSettings(nextSettings); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+				} else {
+					resp.Status = "ok"
+					resp.Payload = engine.HostSettings()
+				}
+			case "host.openLogs":
+				logPath, err := ensureHostLogFile()
+				if err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				if err := openFilePath(logPath); err != nil {
+					slog.Error("open logs failed", "error", err, "path", logPath)
+					resp.Status = "error"
+					resp.Message = err.Error()
+				} else {
+					resp.Status = "ok"
+					resp.Payload = map[string]string{"path": logPath}
+				}
+			case "host.openFile":
+				var params struct {
+					ID string `json:"id"`
+				}
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				state, err := storage.GetDownload(params.ID)
+				if err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				outputPath, err := resolveDownloadOpenPath(state, engine.HostSettings())
+				if err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				if err := openFilePath(outputPath); err != nil {
+					slog.Error("open download file failed", "error", err, "download_id", state.ID, "path", outputPath)
+					resp.Status = "error"
+					resp.Message = err.Error()
+				} else {
+					resp.Status = "ok"
+					resp.Payload = map[string]string{"path": outputPath}
+				}
+			case "host.revealInFolder":
+				var params struct {
+					ID string `json:"id"`
+				}
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				state, err := storage.GetDownload(params.ID)
+				if err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				outputPath, err := resolveDownloadRevealPath(state, engine.HostSettings())
+				if err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				if err := revealFileInFolder(outputPath); err != nil {
+					slog.Error("reveal download file failed", "error", err, "download_id", state.ID, "path", outputPath)
+					resp.Status = "error"
+					resp.Message = err.Error()
+				} else {
+					resp.Status = "ok"
+					resp.Payload = map[string]string{"path": outputPath}
+				}
+			case "host.pickDirectory":
+				var params struct {
+					Initial string `json:"initial,omitempty"`
+				}
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				selectedPath, err := pickDirectory(params.Initial)
+				if err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+				} else {
+					resp.Status = "ok"
+					resp.Payload = map[string]string{"path": selectedPath}
+				}
+			case "download.getProgress":
+				var params struct {
+					ID string `json:"id"`
+				}
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+				} else {
+					state, err := storage.GetDownload(params.ID)
+					if err != nil {
+						resp.Status = "error"
+						resp.Message = err.Error()
+					} else {
+						resp.Status = "ok"
+						resp.Payload = state
+					}
+				}
+			default:
+				resp.Status = "error"
+				resp.Message = "Unknown method: " + req.Method
+				slog.Warn("unknown IPC method", "method", req.Method, "request_id", req.ID)
 			}
 
-			out, _ := json.Marshal(resp)
-			if err := WriteMessage(os.Stdout, out); err != nil {
-				slog.Error("write message failed", "error", err, "request_id", req.ID)
+			if !writeResponse(resp) {
 				break readLoop
 			}
 		}
@@ -509,11 +619,11 @@ func decodeParams(req Request, target interface{}) error {
 	return nil
 }
 
-func pauseAllDownloads(engine *Engine, downloads []DownloadState) error {
+func pauseAllDownloads(ctx context.Context, engine *Engine, downloads []DownloadState) error {
 	for i := range downloads {
 		switch downloads[i].Status {
 		case "downloading", "muxing", "queued":
-			if err := engine.Pause(downloads[i].ID); err != nil {
+			if err := engine.Pause(ctx, downloads[i].ID); err != nil {
 				return err
 			}
 		}
@@ -522,13 +632,13 @@ func pauseAllDownloads(engine *Engine, downloads []DownloadState) error {
 	return nil
 }
 
-func resumeAllDownloads(engine *Engine, downloads []DownloadState) error {
+func resumeAllDownloads(ctx context.Context, engine *Engine, downloads []DownloadState) error {
 	for _, download := range downloads {
 		if download.Status != "paused" && download.Status != "queued" {
 			continue
 		}
 
-		if err := engine.Resume(download.ID); err != nil && err.Error() != "already active" {
+		if err := engine.Resume(ctx, download.ID); err != nil && err.Error() != "already active" {
 			return err
 		}
 	}
@@ -555,4 +665,3 @@ func countActiveDownloads(downloads []DownloadState) int {
 	}
 	return count
 }
-

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -10,12 +11,12 @@ type fakeSchedulerController struct {
 	resumed []string
 }
 
-func (controller *fakeSchedulerController) pauseSystem(id string) error {
+func (controller *fakeSchedulerController) pauseSystem(_ context.Context, id string) error {
 	controller.paused = append(controller.paused, id)
 	return nil
 }
 
-func (controller *fakeSchedulerController) Resume(id string) error {
+func (controller *fakeSchedulerController) Resume(_ context.Context, id string) error {
 	controller.resumed = append(controller.resumed, id)
 	return nil
 }

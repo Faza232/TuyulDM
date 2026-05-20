@@ -867,7 +867,7 @@ func TestEnginePauseMarksQueuedDownloadAsUserPaused(t *testing.T) {
 	engine.queuedSet[state.ID] = struct{}{}
 	engine.mu.Unlock()
 
-	if err := engine.Pause(state.ID); err != nil {
+	if err := engine.Pause(context.Background(), state.ID); err != nil {
 		t.Fatalf("Pause returned error: %v", err)
 	}
 
@@ -950,7 +950,7 @@ func TestEngineRemoveQueuedDownloadDeletesRecordAndQueueEntry(t *testing.T) {
 	engine.queuedSet[state.ID] = struct{}{}
 	engine.mu.Unlock()
 
-	if err := engine.Remove(state.ID, false); err != nil {
+	if err := engine.Remove(context.Background(), state.ID, false); err != nil {
 		t.Fatalf("Remove returned error: %v", err)
 	}
 	if _, err := storage.GetDownload(state.ID); err == nil {
@@ -986,7 +986,7 @@ func TestEngineRemoveFinishedDownloadDeletesFile(t *testing.T) {
 		t.Fatalf("SaveDownload returned error: %v", err)
 	}
 
-	if err := engine.Remove(state.ID, true); err != nil {
+	if err := engine.Remove(context.Background(), state.ID, true); err != nil {
 		t.Fatalf("Remove returned error: %v", err)
 	}
 	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
@@ -1021,7 +1021,7 @@ func TestEngineRemoveVideoDownloadCleansSegmentDir(t *testing.T) {
 		t.Fatalf("SaveDownload returned error: %v", err)
 	}
 
-	if err := engine.Remove(state.ID, false); err != nil {
+	if err := engine.Remove(context.Background(), state.ID, false); err != nil {
 		t.Fatalf("Remove returned error: %v", err)
 	}
 	if _, err := os.Stat(segmentDir); !os.IsNotExist(err) {
@@ -1069,7 +1069,7 @@ func TestEngineRemoveActiveDownloadWaitsForCancellation(t *testing.T) {
 
 	removeDone := make(chan error, 1)
 	go func() {
-		removeDone <- engine.Remove(state.ID, false)
+		removeDone <- engine.Remove(context.Background(), state.ID, false)
 	}()
 
 	select {
@@ -1089,6 +1089,44 @@ func TestEngineRemoveActiveDownloadWaitsForCancellation(t *testing.T) {
 	if _, ok := engine.active[state.ID]; ok {
 		t.Fatal("expected active download entry to be removed")
 	}
+}
+
+func TestEngineRemoveHonorsCanceledContextWhileWaitingForCancellation(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	state := &DownloadState{
+		ID:         "remove-context-canceled",
+		Filename:   "pending.bin",
+		OutputPath: filepath.Join(t.TempDir(), "pending.bin"),
+		Status:     "downloading",
+		Type:       "file",
+		CreatedAt:  time.Now(),
+	}
+	if err := storage.SaveDownload(state); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+
+	engine.mu.Lock()
+	engine.active[state.ID] = &ActiveDownload{
+		State:  state,
+		Cancel: func() {},
+		Done:   make(chan struct{}),
+	}
+	engine.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err := engine.Remove(ctx, state.ID, false)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+	if _, err := storage.GetDownload(state.ID); err != nil {
+		t.Fatalf("expected download record to remain after canceled remove, got %v", err)
+	}
+	engine.mu.Lock()
+	delete(engine.active, state.ID)
+	engine.mu.Unlock()
 }
 
 func TestEngineAddPersistsSchedule(t *testing.T) {
@@ -1150,6 +1188,39 @@ func TestEngineAddHonorsCanceledContext(t *testing.T) {
 
 	if _, err := engine.Add(ctx, DownloadRequest{URL: server.URL + "/cancel.bin", Filename: "cancel.bin", Segments: 1}); err == nil {
 		t.Fatal("expected canceled context error")
+	}
+}
+
+func TestEngineAddUsesProvidedRequestID(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	body := []byte("request-id")
+	digest := md5.Sum(body)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handleRangeResponse(w, r, body, digest)
+	}))
+	defer server.Close()
+
+	state, err := engine.Add(context.Background(), DownloadRequest{
+		ID:       "request-id-123",
+		URL:      server.URL + "/request-id.bin",
+		Filename: "request-id.bin",
+		Segments: 1,
+	})
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if state.ID != "request-id-123" {
+		t.Fatalf("expected provided request id to be preserved, got %q", state.ID)
+	}
+	persisted, err := storage.GetDownload("request-id-123")
+	if err != nil {
+		t.Fatalf("GetDownload returned error: %v", err)
+	}
+	if persisted.ID != "request-id-123" {
+		t.Fatalf("expected persisted id to match provided request id, got %q", persisted.ID)
 	}
 }
 
@@ -1261,7 +1332,7 @@ func TestEngineResumeSendsIfRangeAndCompletesOnValidatorMatch(t *testing.T) {
 		t.Fatalf("SaveDownload returned error: %v", err)
 	}
 
-	if err := engine.Resume(state.ID); err != nil {
+	if err := engine.Resume(context.Background(), state.ID); err != nil {
 		t.Fatalf("Resume returned error: %v", err)
 	}
 
@@ -1338,7 +1409,7 @@ func TestEngineResumeRemoteChangeRedownloadsFromScratch(t *testing.T) {
 		t.Fatalf("SaveDownload returned error: %v", err)
 	}
 
-	if err := engine.Resume(state.ID); err != nil {
+	if err := engine.Resume(context.Background(), state.ID); err != nil {
 		t.Fatalf("Resume returned error: %v", err)
 	}
 
@@ -1415,7 +1486,7 @@ func TestEngineResumeRemoteChangeSizeMismatchFails(t *testing.T) {
 		t.Fatalf("SaveDownload returned error: %v", err)
 	}
 
-	if err := engine.Resume(state.ID); err != nil {
+	if err := engine.Resume(context.Background(), state.ID); err != nil {
 		t.Fatalf("Resume returned error: %v", err)
 	}
 
@@ -1524,7 +1595,7 @@ func TestEngineRefreshURLResumesExpiredDownload(t *testing.T) {
 		t.Fatalf("SaveDownload returned error: %v", err)
 	}
 
-	updated, err := engine.RefreshURL(state.ID, server.URL+"/file.bin", false, false)
+	updated, err := engine.RefreshURL(context.Background(), state.ID, server.URL+"/file.bin", false, false)
 	if err != nil {
 		t.Fatalf("RefreshURL returned error: %v", err)
 	}
@@ -1592,7 +1663,7 @@ func TestEngineRefreshURLReturnsETagMismatchDetails(t *testing.T) {
 		t.Fatalf("SaveDownload returned error: %v", err)
 	}
 
-	_, err := engine.RefreshURL(state.ID, server.URL+"/file.bin", false, false)
+	_, err := engine.RefreshURL(context.Background(), state.ID, server.URL+"/file.bin", false, false)
 	if err == nil {
 		t.Fatal("expected RefreshURL to fail on etag mismatch")
 	}
@@ -1668,7 +1739,7 @@ func TestEngineRefreshURLRestartsFromScratchOnSizeMismatch(t *testing.T) {
 		t.Fatalf("SaveDownload returned error: %v", err)
 	}
 
-	updated, err := engine.RefreshURL(state.ID, server.URL+"/file.bin", true, true)
+	updated, err := engine.RefreshURL(context.Background(), state.ID, server.URL+"/file.bin", true, true)
 	if err != nil {
 		t.Fatalf("RefreshURL returned error: %v", err)
 	}
@@ -1690,6 +1761,81 @@ func TestEngineRefreshURLRestartsFromScratchOnSizeMismatch(t *testing.T) {
 	}
 	if !bytes.Equal(downloaded, newBody) {
 		t.Fatal("expected forced refresh restart to redownload new body")
+	}
+}
+
+func TestEngineRefreshURLHonorsCanceledContext(t *testing.T) {
+	storage := newTestStorage(t)
+	engine := NewEngine(storage, nil)
+	requestStarted := make(chan struct{}, 1)
+	requestCanceled := make(chan struct{}, 1)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestStarted <- struct{}{}
+		<-r.Context().Done()
+		requestCanceled <- struct{}{}
+	}))
+	defer server.Close()
+
+	state := &DownloadState{
+		ID:             "refresh-url-context-canceled",
+		URL:            "https://expired.example.test/file.bin",
+		Filename:       "context.bin",
+		OutputPath:     filepath.Join(t.TempDir(), "context.bin"),
+		TotalSize:      1024,
+		TotalSizeAtAdd: 1024,
+		Status:         "awaiting_url_refresh",
+		Type:           "file",
+		CreatedAt:      time.Now(),
+		ErrorCode:      "url_expired",
+		Segments: []Segment{{
+			Index: 0,
+			Start: 0,
+			End:   1023,
+		}},
+	}
+	if err := storage.SaveDownload(state); err != nil {
+		t.Fatalf("SaveDownload returned error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := engine.RefreshURL(ctx, state.ID, server.URL+"/file.bin", false, false)
+		errCh <- err
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for refresh probe request")
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context canceled, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for RefreshURL to return")
+	}
+
+	select {
+	case <-requestCanceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for probe request cancellation")
+	}
+
+	persisted, err := storage.GetDownload(state.ID)
+	if err != nil {
+		t.Fatalf("GetDownload returned error: %v", err)
+	}
+	if persisted.URL != state.URL {
+		t.Fatalf("expected URL to remain %q, got %q", state.URL, persisted.URL)
+	}
+	if persisted.Status != "awaiting_url_refresh" {
+		t.Fatalf("expected status to remain awaiting_url_refresh, got %q", persisted.Status)
 	}
 }
 
@@ -1743,7 +1889,7 @@ func TestEngineResumeRangeNotSatisfiableRetriesFromSegmentStart(t *testing.T) {
 		t.Fatalf("SaveDownload returned error: %v", err)
 	}
 
-	if err := engine.Resume(state.ID); err != nil {
+	if err := engine.Resume(context.Background(), state.ID); err != nil {
 		t.Fatalf("Resume returned error: %v", err)
 	}
 
@@ -1811,7 +1957,7 @@ func TestEngineResumeRangeNotSatisfiableTwiceSurfacesRangeUnsupported(t *testing
 		t.Fatalf("SaveDownload returned error: %v", err)
 	}
 
-	if err := engine.Resume(state.ID); err != nil {
+	if err := engine.Resume(context.Background(), state.ID); err != nil {
 		t.Fatalf("Resume returned error: %v", err)
 	}
 
@@ -1848,7 +1994,7 @@ func TestEngineResumeAfterIntegrityErrorResetsSegments(t *testing.T) {
 		t.Fatalf("SaveDownload returned error: %v", err)
 	}
 
-	if err := engine.Resume(state.ID); err != nil {
+	if err := engine.Resume(context.Background(), state.ID); err != nil {
 		t.Fatalf("Resume returned error: %v", err)
 	}
 
