@@ -23,7 +23,9 @@ export function TopBar({ activeRoute, onAddUrl, onSearch, toggleSidebar }: TopBa
 
   return (
     <Toolbar ariaLabel="Main toolbar">
-      <IconButton icon={<MenuIcon />} aria-label="Toggle sidebar" onClick={toggleSidebar} />
+      <IconButton label="Toggle sidebar" onClick={toggleSidebar}>
+        <MenuIcon />
+      </IconButton>
       <div className="flex items-center gap-2 ml-2">
         <span className="font-bold text-[var(--color-text)]">TuyulDM</span>
         <span className="text-[var(--color-text-dim)]">/</span>
@@ -58,7 +60,11 @@ export function TopBar({ activeRoute, onAddUrl, onSearch, toggleSidebar }: TopBa
             ]
           }
         ]}
-        trigger={<IconButton icon={<MoreHorizontal />} aria-label="Options" />}
+        trigger={
+          <IconButton label="Options">
+            <MoreHorizontal />
+          </IconButton>
+        }
       />
 
       <Button variant="primary" size="sm" onClick={onAddUrl}>

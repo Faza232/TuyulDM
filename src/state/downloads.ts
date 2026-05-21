@@ -41,5 +41,5 @@ export function useDownloads() {
     fetchDownloads();
   };
 
-  return { downloads, isLoading, pause, resume, cancel, refresh: fetchDownloads };
+  const refreshUrl = async (id: string | number) => { const download = downloads.find(d => d.id === id); if (!download) return; await bridge.refreshUrl(id, download.url || ""); fetchDownloads(); }; return { downloads, isLoading, pause, resume, cancel, refreshUrl, refresh: fetchDownloads };
 }

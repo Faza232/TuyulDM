@@ -13,7 +13,7 @@ export default function Popup() {
       <div>
         {streams.map((s, i) => (
           <div key={i} className="mb-2 p-2 bg-[var(--color-surface)] border border-[var(--color-border)]">
-            {s.title || 'Unknown Stream'}
+            {s.label || s.url || 'Unknown Stream'}
           </div>
         ))}
       </div>
