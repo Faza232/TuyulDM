@@ -1,17 +1,10 @@
-import { StrictMode } from 'react';
-import { createRoot } from 'react-dom/client';
-
-import App from './App';
-import Dev from './ui/_dev';
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import Options from './surfaces/options/Options';
 import './index.css';
 
-const params = new URLSearchParams(window.location.search);
-const isDev = import.meta.env.DEV && params.get('dev') === '1';
-
-const root = createRoot(document.getElementById('root')!);
-
-root.render(
-  <StrictMode>
-    {isDev ? <Dev /> : <App surface="options" />}
-  </StrictMode>,
+ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
+  <React.StrictMode>
+    <Options />
+  </React.StrictMode>,
 );
