@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react';
-import { useDownloads } from '../../../state';
+import { useState, useEffect } from "react";
+import { motion, AnimatePresence } from "motion/react";
+import { useDownloads, useUISettings } from '../../../state';
 import { useCommands } from '../../../state/commands';
 import { useShortcuts } from '../../../state/shortcuts';
 import { EmptyState } from '../../../ui/primitives';
@@ -10,6 +11,7 @@ import type { DownloadItem } from '../../../state/types';
 
 export default function QueueRoute() {
   const { downloads, refreshUrl, pause, resume, cancel } = useDownloads();
+  const { uiSettings } = useUISettings();
   const [selectedId, setSelectedId] = useState<string | number | null>(null);
   const [detailsId, setDetailsId] = useState<string | number | null>(null);
   
@@ -125,27 +127,36 @@ export default function QueueRoute() {
   return (
     <div className="p-4 h-full overflow-y-auto">
       <div className="flex flex-col gap-1 max-w-5xl mx-auto">
-        {activeDownloads.map((d) => (
-          <div key={d.id} onDoubleClick={() => {
-             if (!['error', 'awaiting_url_refresh'].includes(d.status) && d.extraction_strategy !== 'unsupported_protected') {
-                setDetailsId(d.id);
-             }
-          }}>
-            <DownloadRow
-              download={d as DownloadItem}
-              density="cozy"
-              selected={selectedId === d.id}
-              onClick={() => {
-                setSelectedId(d.id);
-              }}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                setSelectedId(d.id);
-              }}
-              onAction={handleAction}
-            />
-          </div>
-        ))}
+        <AnimatePresence initial={false}>
+          {activeDownloads.map((d) => (
+            <motion.div 
+              key={d.id} 
+              layout
+              initial={{ opacity: 0, y: -10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, x: -10 }}
+              transition={{ duration: 0.12, ease: [0.2, 0.8, 0.2, 1] }}
+              onDoubleClick={() => {
+               if (!['error', 'awaiting_url_refresh'].includes(d.status) && d.extraction_strategy !== 'unsupported_protected') {
+                  setDetailsId(d.id);
+               }
+            }}>
+              <DownloadRow
+                download={d as DownloadItem}
+                density={uiSettings.density}
+                selected={selectedId === d.id}
+                onClick={() => {
+                  setSelectedId(d.id);
+                }}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setSelectedId(d.id);
+                }}
+                onAction={handleAction}
+              />
+            </motion.div>
+          ))}
+        </AnimatePresence>
       </div>
 
       <DownloadDetailsDrawer

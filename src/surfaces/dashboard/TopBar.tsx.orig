@@ -3,7 +3,6 @@ import { Search, Plus, Menu as MenuIcon, MoreHorizontal, Monitor } from '../../u
 import { Button, IconButton, Input, Toolbar, ToolbarSpacer, Kbd, Menu } from '../../ui/primitives';
 import type { AppRoute } from './Sidebar';
 import { useCommands } from '../../state/commands';
-import { useUISettings } from '../../state/ui_settings';
 
 interface TopBarProps {
   activeRoute: AppRoute;
@@ -21,8 +20,8 @@ const routeTitles: Record<AppRoute, string> = {
 };
 
 export function TopBar({ activeRoute, onAddUrl, onSearch, toggleSidebar }: TopBarProps) {
+  const [density, setDensity] = useState<'cozy' | 'compact'>('cozy');
   const { setOpen: setPaletteOpen } = useCommands();
-  const { uiSettings, updateUISettings } = useUISettings();
 
   return (
     <Toolbar ariaLabel="Main toolbar">
@@ -60,9 +59,9 @@ export function TopBar({ activeRoute, onAddUrl, onSearch, toggleSidebar }: TopBa
             items: [
               {
                 id: 'density',
-                label: `Density: ${uiSettings.density === 'cozy' ? 'Compact' : 'Cozy'}`,
+                label: `Density: ${density === 'cozy' ? 'Compact' : 'Cozy'}`,
                 icon: <Monitor />,
-                onSelect: () => updateUISettings({ density: uiSettings.density === 'cozy' ? 'compact' : 'cozy' })
+                onSelect: () => setDensity(d => d === 'cozy' ? 'compact' : 'cozy')
               }
             ]
           }

@@ -6,3 +6,4 @@ export * from './settings';
 export * from './toast';
 export * from './shortcuts';
 export * from './permissions';
+export * from './ui_settings';

@@ -26,7 +26,6 @@ export default function Dashboard({ surface = 'dashboard' }: { surface?: 'dashbo
   
   const [showShortcuts, setShowShortcuts] = useState(false);
 
-  const { updateUISettings } = useUISettings();
   const { downloads } = useDownloads();
   const { streams } = useDetection();
   
@@ -62,9 +61,7 @@ export default function Dashboard({ surface = 'dashboard' }: { surface?: 'dashbo
       { id: 'nav:finished', label: 'Go to Finished', group: 'Navigation', shortcut: ['g', 'f'], onSelect: () => setActiveRoute('finished') },
       { id: 'nav:grabber', label: 'Go to Video Grabber', group: 'Navigation', shortcut: ['g', 'g'], onSelect: () => setActiveRoute('grabber') },
       { id: 'nav:logs', label: 'Go to Logs', group: 'Navigation', onSelect: () => setActiveRoute('logs') },
-      { id: 'nav:settings', label: 'Open Settings', group: 'Navigation', onSelect: () => window.open(chrome.runtime.getURL('options.html')) },
-      { id: 'sys:density:cozy', label: 'Density: Cozy', group: 'System', onSelect: () => updateUISettings({ density: 'cozy' }) },
-      { id: 'sys:density:compact', label: 'Density: Compact', group: 'System', onSelect: () => updateUISettings({ density: 'compact' }) }
+      { id: 'nav:settings', label: 'Open Settings', group: 'Navigation', onSelect: () => window.open(chrome.runtime.getURL('options.html')) }
     ]);
   }, []);
 

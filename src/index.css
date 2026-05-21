@@ -80,3 +80,13 @@
     transition-duration: 0.01ms !important;
   }
 }
+
+@layer components {
+  /* Density overrides for Sidebar and Toolbar */
+  [data-density="compact"] nav[aria-label="Sidebar"] button {
+    @apply h-7 text-[12px] px-1.5;
+  }
+  [data-density="compact"] div[role="toolbar"] {
+    @apply h-10 px-3;
+  }
+}
