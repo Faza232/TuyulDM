@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Search, Plus, Menu as MenuIcon, MoreHorizontal, Monitor } from '../../ui/icons';
 import { Button, IconButton, Input, Toolbar, ToolbarSpacer, Kbd, Menu } from '../../ui/primitives';
 import type { AppRoute } from './Sidebar';
+import { useCommands } from '../../state/commands';
 
 interface TopBarProps {
   activeRoute: AppRoute;
@@ -20,6 +21,7 @@ const routeTitles: Record<AppRoute, string> = {
 
 export function TopBar({ activeRoute, onAddUrl, onSearch, toggleSidebar }: TopBarProps) {
   const [density, setDensity] = useState<'cozy' | 'compact'>('cozy');
+  const { setOpen: setPaletteOpen } = useCommands();
 
   return (
     <Toolbar ariaLabel="Main toolbar">
@@ -34,12 +36,16 @@ export function TopBar({ activeRoute, onAddUrl, onSearch, toggleSidebar }: TopBa
       
       <ToolbarSpacer />
       
-      <div className="relative flex items-center w-64 mr-2">
+      <div 
+        className="relative flex items-center w-64 mr-2 group cursor-pointer"
+        onClick={() => setPaletteOpen(true)}
+      >
         <Input 
-          className="w-full"
+          className="w-full pointer-events-none"
           iconLeft={<Search />}
-          placeholder="Search..." 
-          onChange={(e) => onSearch(e.target.value)}
+          placeholder="Command palette..." 
+          readOnly
+          tabIndex={-1}
         />
         <div className="absolute right-2 flex items-center pointer-events-none">
           <Kbd>⌘K</Kbd>
