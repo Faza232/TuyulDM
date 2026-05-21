@@ -163,6 +163,13 @@ func main() {
 	if err := storage.PauseActiveDownloads(); err != nil {
 		slog.Warn("pause stale downloads failed", "error", err)
 	}
+	offerCache := newMediaOfferCache()
+	adapterRegistry := NewSiteAdapterRegistry()
+	adapterRegistry.Register(NewExternalResolverAdapter())
+	SetActiveResolverContext(&ResolverContext{
+		Adapters: adapterRegistry,
+		Settings: engine.HostSettings,
+	})
 	scheduler := newDownloadScheduler(storage, engine)
 	if err := scheduler.Reconcile(time.Now()); err != nil {
 		slog.Warn("initial scheduler reconcile failed", "error", err)
@@ -280,6 +287,74 @@ readLoop:
 					// Auto-start for now
 					engine.Start(state.ID)
 				}
+			case "media.resolve":
+				var params MediaResolveRequest
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				requestCtx, cancel := context.WithCancel(hostCtx)
+				offer, err := ResolveMediaOffer(requestCtx, params)
+				cancel()
+				if err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+				} else {
+					offerCache.Put(offer)
+					resp.Status = "ok"
+					resp.Payload = offer
+				}
+			case "offer.refresh":
+				var params OfferRefreshRequest
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				dispatchAsync(params.DownloadID, func(requestCtx context.Context) Response {
+					resp := Response{ID: req.ID}
+					result, err := engine.RefreshOffer(requestCtx, offerCache, params)
+					if err != nil {
+						resp.Status = "error"
+						resp.Message = err.Error()
+						if result != nil {
+							resp.Payload = result
+						}
+						return resp
+					}
+					resp.Status = "ok"
+					resp.Payload = result
+					return resp
+				})
+				continue
+			case "media.download":
+				var params MediaDownloadRequest
+				if err := decodeParams(req, &params); err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				offer, err := offerCache.Get(params.OfferID)
+				if err != nil {
+					resp.Status = "error"
+					resp.Message = err.Error()
+					break
+				}
+				dispatchAsync(params.OfferID, func(requestCtx context.Context) Response {
+					resp := Response{ID: req.ID}
+					state, err := engine.AddMediaOffer(requestCtx, offer, params)
+					if err != nil {
+						resp.Status = "error"
+						resp.Message = err.Error()
+						return resp
+					}
+					resp.Status = "ok"
+					resp.Payload = state
+					_ = engine.Start(state.ID)
+					return resp
+				})
+				continue
 			case "download.pause":
 				var params struct {
 					ID string `json:"id"`

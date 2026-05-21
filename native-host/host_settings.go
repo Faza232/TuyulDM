@@ -21,6 +21,10 @@ type HostSettings struct {
 	SegmentStallTimeoutSec            int    `json:"segmentStallTimeoutSec"`
 	DownloadDir                       string `json:"downloadDir"`
 	LogLevel                          string `json:"logLevel"`
+	ExternalResolverEnabled           bool   `json:"externalResolverEnabled,omitempty"`
+	ExternalResolverBinary            string `json:"externalResolverBinary,omitempty"`
+	ExternalResolverTimeoutMs         int    `json:"externalResolverTimeoutMs,omitempty"`
+	ExternalResolverDebug             bool   `json:"externalResolverDebug,omitempty"`
 }
 
 type HostSettingsUpdate struct {
@@ -32,6 +36,10 @@ type HostSettingsUpdate struct {
 	SegmentStallTimeoutSec            *int    `json:"segmentStallTimeoutSec,omitempty"`
 	DownloadDir                       *string `json:"downloadDir,omitempty"`
 	LogLevel                          *string `json:"logLevel,omitempty"`
+	ExternalResolverEnabled           *bool   `json:"externalResolverEnabled,omitempty"`
+	ExternalResolverBinary            *string `json:"externalResolverBinary,omitempty"`
+	ExternalResolverTimeoutMs         *int    `json:"externalResolverTimeoutMs,omitempty"`
+	ExternalResolverDebug             *bool   `json:"externalResolverDebug,omitempty"`
 }
 
 func defaultHostSettings() HostSettings {
@@ -104,6 +112,18 @@ func applyHostSettingsUpdate(current HostSettings, update HostSettingsUpdate) Ho
 	}
 	if update.LogLevel != nil {
 		current.LogLevel = *update.LogLevel
+	}
+	if update.ExternalResolverEnabled != nil {
+		current.ExternalResolverEnabled = *update.ExternalResolverEnabled
+	}
+	if update.ExternalResolverBinary != nil {
+		current.ExternalResolverBinary = *update.ExternalResolverBinary
+	}
+	if update.ExternalResolverTimeoutMs != nil {
+		current.ExternalResolverTimeoutMs = *update.ExternalResolverTimeoutMs
+	}
+	if update.ExternalResolverDebug != nil {
+		current.ExternalResolverDebug = *update.ExternalResolverDebug
 	}
 	return normalizeHostSettings(current)
 }

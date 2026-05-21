@@ -31,6 +31,89 @@ export type DetectedMediaEntry = {
   protectedReason?: string;
 };
 
+export type ExtractionStrategy =
+  | 'direct_file'
+  | 'progressive_stream'
+  | 'hls_manifest'
+  | 'dash_manifest'
+  | 'mse_observed_manifest'
+  | 'page_metadata'
+  | 'site_adapter'
+  | 'unsupported_protected';
+
+export type MediaTrack = {
+  id: string;
+  kind: string;
+  url?: string;
+  manifest_url?: string;
+  codec?: string;
+  bitrate?: number;
+  width?: number;
+  height?: number;
+  container?: string;
+};
+
+export type MediaEvidence = {
+  candidateUrl?: string;
+  contentType?: string;
+  manifestType?: ManifestType;
+  mimeFromMSE?: string;
+  sawBlobPlayback?: boolean;
+  sawRangeRequests?: boolean;
+  hadAudioVideoTraffic?: boolean;
+  topOrigin?: string;
+};
+
+export type MediaOffer = {
+  id: string;
+  page_url?: string;
+  source_url: string;
+  site_key?: string;
+  title?: string;
+  strategy: ExtractionStrategy;
+  container?: string;
+  mime_type?: string;
+  needs_playback?: boolean;
+  protected?: boolean;
+  protected_reason?: string;
+  expires_at?: string;
+  tracks?: MediaTrack[];
+  variants?: VariantInfo[];
+  headers?: Record<string, string>;
+  debug?: Record<string, string>;
+};
+
+export const STRATEGY_LABELS: Record<ExtractionStrategy, string> = {
+  direct_file: 'Direct',
+  progressive_stream: 'Progressive',
+  hls_manifest: 'HLS',
+  dash_manifest: 'DASH',
+  mse_observed_manifest: 'Observed in player',
+  page_metadata: 'Page metadata',
+  site_adapter: 'Site adapter',
+  unsupported_protected: 'Protected',
+};
+
+export function strategyAssemblyKind(strategy?: ExtractionStrategy | string | null): 'direct' | 'adaptive' | 'muxed' | 'protected' | 'unknown' {
+  switch (strategy) {
+    case 'direct_file':
+    case 'progressive_stream':
+      return 'direct';
+    case 'hls_manifest':
+    case 'mse_observed_manifest':
+      return 'adaptive';
+    case 'dash_manifest':
+      return 'muxed';
+    case 'page_metadata':
+    case 'site_adapter':
+      return 'adaptive';
+    case 'unsupported_protected':
+      return 'protected';
+    default:
+      return 'unknown';
+  }
+}
+
 export type MediaCandidate = {
   url: string;
   frameUrl?: string;

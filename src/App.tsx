@@ -23,7 +23,8 @@ import {
   X,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
-import type { DetectedMediaEntry, VariantInfo } from '../extension/src/shared/media_classify';
+import type { DetectedMediaEntry, ExtractionStrategy, VariantInfo } from '../extension/src/shared/media_classify';
+import { STRATEGY_LABELS, strategyAssemblyKind } from '../extension/src/shared/media_classify';
 
 type AppSurface = 'dashboard' | 'popup' | 'options';
 
@@ -47,6 +48,42 @@ interface DownloadItem {
   error?: string;
   error_code?: string;
   last_attempt_at?: string;
+  extraction_strategy?: ExtractionStrategy | string;
+  site_key?: string;
+  offer_title?: string;
+  offer_debug?: Record<string, string>;
+  track_count?: number;
+  assembly_stage?: string;
+  plan?: { strategy?: string; final_container?: string; steps?: { kind: string }[] } | null;
+}
+
+const PROTECTED_REASON_LABELS: Record<string, string> = {
+  drm_detected: 'Encrypted (DRM)',
+  encrypted_hls: 'Encrypted HLS stream',
+  unsupported_site_strategy: 'Site strategy not supported',
+  site_adapter_failed: 'Site adapter failed',
+};
+
+function describeProtectedReason(code?: string) {
+  if (!code) {
+    return 'Refused';
+  }
+  return PROTECTED_REASON_LABELS[code] || code;
+}
+
+function buildSafeDebugSnapshot(download: DownloadItem) {
+  return {
+    id: download.id,
+    name: download.name || download.filename,
+    extraction_strategy: download.extraction_strategy,
+    site_key: download.site_key,
+    track_count: download.track_count,
+    assembly_stage: download.assembly_stage,
+    plan: download.plan,
+    offer_debug: download.offer_debug,
+    status: download.status,
+    error_code: download.error_code,
+  };
 }
 
 interface RefreshUrlResponse {
@@ -2223,6 +2260,42 @@ export default function App({ surface = 'dashboard' }: AppProps) {
                         <div className="data-value opacity-40">{typeof download.id === 'number' ? download.id.toString().padStart(2, '0') : download.id.substring(0, 4)}</div>
                         <div className="flex flex-col min-w-0 pr-4">
                           <div className="font-medium truncate text-[13px] text-white/90">{download.name || download.filename}</div>
+                          {(download.extraction_strategy || download.site_key) && (
+                            <div className="mt-1 flex items-center gap-1.5 text-[9px] font-mono uppercase tracking-widest">
+                              {download.extraction_strategy && (
+                                <span className="rounded-md border border-white/15 bg-white/5 px-1.5 py-0.5 text-white/70">
+                                  {STRATEGY_LABELS[download.extraction_strategy as ExtractionStrategy] || download.extraction_strategy}
+                                </span>
+                              )}
+                              {download.extraction_strategy && (
+                                <span className="text-white/40">{strategyAssemblyKind(download.extraction_strategy)}</span>
+                              )}
+                              {download.site_key && (
+                                <span className="text-white/40 truncate">{download.site_key}</span>
+                              )}
+                              {typeof download.track_count === 'number' && download.track_count > 0 && (
+                                <span className="text-white/40">{download.track_count} tr</span>
+                              )}
+                              {download.assembly_stage && (
+                                <span className="rounded-md border border-blue-400/25 bg-blue-400/10 px-1.5 py-0.5 text-blue-200">
+                                  {download.assembly_stage}
+                                </span>
+                              )}
+                              {download.extraction_strategy === 'unsupported_protected' && (
+                                <span className="rounded-md border border-red-400/30 bg-red-400/10 px-1.5 py-0.5 text-red-200">
+                                  {describeProtectedReason(download.error_code || download.offer_debug?.protected_reason)}
+                                </span>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => void copyPathToClipboard(JSON.stringify(buildSafeDebugSnapshot(download), null, 2))}
+                                className="rounded-md border border-white/10 px-1.5 py-0.5 text-white/45 transition-colors hover:border-white/25 hover:text-white/80"
+                                title="Copy strategy debug JSON"
+                              >
+                                debug
+                              </button>
+                            </div>
+                          )}
                           {download.output_path && (
                             <div className="mt-1 flex items-center gap-1.5 min-w-0">
                               <div className="truncate text-[10px] font-mono text-white/35" title={download.output_path}>{getDownloadParentDirectory(download.output_path)}</div>

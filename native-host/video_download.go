@@ -61,27 +61,104 @@ func (e *Engine) AddVideo(ctx context.Context, req VideoDownloadRequest) (*Downl
 
 	id := fmt.Sprintf("%d%d", os.Getpid(), time.Now().UnixNano())
 	state := &DownloadState{
-		ID:                id,
-		URL:               req.URL,
-		TotalSize:         totalSize,
-		Status:            "queued",
-		Type:              "video",
-		CreatedAt:         time.Now(),
-		Headers:           headers,
-		Cookies:           cookies,
-		ManifestType:      manifest.ManifestType,
-		SelectedVariantID: manifest.SelectedVariantID,
-		VideoContainer:    manifest.Container,
-		Parallelism:       parallelism,
-		Variants:          manifest.Variants,
-		Segments:          manifest.Segments,
-		Schedule:          cloneDownloadSchedule(req.Schedule),
+		ID:                 id,
+		URL:                req.URL,
+		TotalSize:          totalSize,
+		Status:             "queued",
+		Type:               "video",
+		CreatedAt:          time.Now(),
+		Headers:            headers,
+		Cookies:            cookies,
+		ManifestType:       manifest.ManifestType,
+		SelectedVariantID:  manifest.SelectedVariantID,
+		VideoContainer:     manifest.Container,
+		Parallelism:        parallelism,
+		Variants:           manifest.Variants,
+		Segments:           manifest.Segments,
+		Schedule:           cloneDownloadSchedule(req.Schedule),
+		ExtractionStrategy: legacyStrategyFromManifest(manifest.ManifestType),
+		SiteKey:            siteKeyFromURL(req.URL),
+		TrackCount:         len(manifest.Variants),
 	}
 
 	if err := e.assignDownloadTargetAndSave(state, ensureVideoFilename(req.Filename)); err != nil {
 		return nil, err
 	}
 
+	return state, nil
+}
+
+func legacyStrategyFromManifest(manifestType string) string {
+	switch strings.ToUpper(strings.TrimSpace(manifestType)) {
+	case manifestTypeHLS:
+		return string(StrategyHLSManifest)
+	case manifestTypeDASH:
+		return string(StrategyDASHManifest)
+	}
+	return ""
+}
+
+// AddMediaOffer materializes a resolved MediaOffer into a DownloadState,
+// dispatching to the file engine for direct/progressive offers and the video
+// engine for manifest offers. Phase P compat path: delegates resolution work
+// to existing engines, then stamps strategy metadata on the resulting state.
+func (e *Engine) AddMediaOffer(ctx context.Context, offer *MediaOffer, req MediaDownloadRequest) (*DownloadState, error) {
+	if offer == nil {
+		return nil, fmt.Errorf("offer is required")
+	}
+	if offer.Protected || offer.Strategy == StrategyUnsupportedProtected {
+		reason := strings.TrimSpace(offer.ProtectedReason)
+		if reason == "" {
+			reason = "drm_detected"
+		}
+		return nil, fmt.Errorf("offer refused: %s", reason)
+	}
+
+	switch offer.Strategy {
+	case StrategyDirectFile, StrategyProgressiveStream:
+		filename := pickFirstNonEmpty(req.Filename, offer.Title)
+		state, err := e.Add(ctx, DownloadRequest{
+			ID:       newDownloadStateID(),
+			URL:      offer.SourceURL,
+			Filename: filename,
+			Headers:  offer.Headers,
+			Cookies:  offer.Cookies,
+			Schedule: cloneDownloadSchedule(req.Schedule),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return e.stampOfferMetadata(state, offer)
+	case StrategyHLSManifest, StrategyDASHManifest, StrategyMSEObserved:
+		videoReq := videoDownloadRequestFromOffer(offer, req.SelectedVariantID, pickFirstNonEmpty(req.Filename, offer.Title), req.Schedule)
+		state, err := e.AddVideo(ctx, videoReq)
+		if err != nil {
+			return nil, err
+		}
+		return e.stampOfferMetadata(state, offer)
+	default:
+		return nil, fmt.Errorf("offer strategy %q not supported yet", offer.Strategy)
+	}
+}
+
+func newDownloadStateID() string {
+	return fmt.Sprintf("%d%d", os.Getpid(), time.Now().UnixNano())
+}
+
+func (e *Engine) stampOfferMetadata(state *DownloadState, offer *MediaOffer) (*DownloadState, error) {
+	if state == nil || offer == nil {
+		return state, nil
+	}
+	state.ExtractionStrategy = string(offer.Strategy)
+	state.SiteKey = offer.SiteKey
+	state.OfferTitle = offer.Title
+	state.OfferDebug = compactOfferDebug(offer)
+	state.TrackCount = offerTrackCount(offer)
+	if plan, err := PlanFromOffer(offer); err == nil {
+		state.Plan = plan
+	}
+	state.AssemblyStage = AssemblyStageFetching
+	e.persistSnapshot(cloneDownloadState(state))
 	return state, nil
 }
 
@@ -194,6 +271,7 @@ func (e *Engine) runVideoDownload(a *ActiveDownload) {
 		setDownloadSpeed(a.State, 0)
 	} else {
 		a.State.Status = "finished"
+		a.State.AssemblyStage = AssemblyStageFinalizing
 		a.State.Progress = 100
 		setDownloadSpeed(a.State, 0)
 		clearDownloadFailureState(a.State)
@@ -578,6 +656,11 @@ func trackContainerExt(state *DownloadState, track string) string {
 func (e *Engine) muxVideoSegments(a *ActiveDownload, inputs []videoTrackInput, output string) error {
 	a.mu.Lock()
 	a.State.Status = "muxing"
+	if len(inputs) > 1 {
+		a.State.AssemblyStage = AssemblyStageMuxing
+	} else {
+		a.State.AssemblyStage = AssemblyStageRemuxing
+	}
 	setDownloadSpeed(a.State, 0)
 	a.State.Speed = "muxing"
 	snapshot := cloneDownloadState(a.State)
