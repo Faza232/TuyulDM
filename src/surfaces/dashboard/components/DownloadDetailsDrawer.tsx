@@ -1,6 +1,7 @@
 import { Drawer, Button, IconButton, Chip } from '../../../ui/primitives';
-import { FolderOpen, Copy } from '../../../ui/icons';
+import { FolderOpen, Copy, AlertCircle } from '../../../ui/icons';
 import type { DownloadItem } from '../../../state/types';
+import { refusalMessage } from '../../../state/messages';
 
 interface DownloadDetailsDrawerProps {
   download: DownloadItem | null;
@@ -12,6 +13,9 @@ interface DownloadDetailsDrawerProps {
 
 export function DownloadDetailsDrawer({ download, open, onClose, onOpenFolder, onRefreshUrl }: DownloadDetailsDrawerProps) {
   if (!download) return null;
+
+  const isError = download.status === 'error' || download.status === 'awaiting_url_refresh';
+  const refusalMsg = isError ? refusalMessage(download.error_code || download.error) : null;
 
   return (
     <Drawer
@@ -29,6 +33,29 @@ export function DownloadDetailsDrawer({ download, open, onClose, onOpenFolder, o
       }
     >
       <div className="flex flex-col gap-6">
+        {refusalMsg && (
+          <div className="flex gap-3 bg-[var(--color-danger)]/10 border border-[var(--color-danger)]/20 p-3 rounded-[var(--radius-md)]">
+             <AlertCircle className="size-5 text-[var(--color-danger)] shrink-0" />
+             <div className="flex flex-col flex-1">
+                <span className="font-semibold text-[13px] text-[var(--color-danger)]">{refusalMsg.title}</span>
+                {refusalMsg.body && <span className="text-[12px] text-[var(--color-danger)]/80 mt-0.5">{refusalMsg.body}</span>}
+                {refusalMsg.recovery && (
+                   <div className="mt-2">
+                     <Button 
+                        variant="secondary" 
+                        size="sm" 
+                        onClick={() => {
+                           if (refusalMsg.recovery?.type === 'RefreshFromCurrentTab') onRefreshUrl(download.id);
+                           else if (refusalMsg.recovery?.type === 'OpenDocs' && refusalMsg.recovery.url) window.open(refusalMsg.recovery.url, '_blank');
+                        }}
+                     >
+                       {refusalMsg.recovery.label}
+                     </Button>
+                   </div>
+                )}
+             </div>
+          </div>
+        )}
         <section className="flex flex-col gap-2">
           <div className="text-[10px] font-medium uppercase tracking-widest text-[var(--color-text-dim)]">Output</div>
           <div className="flex items-center justify-between text-[13px] bg-[var(--color-surface-raised)] border border-[var(--color-border-subtle)] rounded-[var(--radius-sm)] p-2">

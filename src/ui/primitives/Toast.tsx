@@ -9,7 +9,7 @@ import {
   type ReactNode,
 } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { AlertCircle, AlertTriangle, CheckCircle2, Info, X } from '../icons';
+import { AlertCircle, AlertTriangle, CheckCircle2, Info, X, ChevronUp, ChevronDown } from '../icons';
 import { IconButton } from './IconButton';
 import { cn } from '../cn';
 
@@ -107,7 +107,11 @@ export function useToast(): ToastContextValue {
 const MAX_STACK = 4;
 
 function ToastRegion({ toasts, dismiss }: { toasts: ToastEntry[]; dismiss: (id: string) => void }) {
-  const visible = toasts.slice(-MAX_STACK);
+  const [expanded, setExpanded] = useState(false);
+  const hiddenCount = toasts.length > MAX_STACK ? toasts.length - MAX_STACK : 0;
+  
+  const visible = expanded ? toasts : toasts.slice(-MAX_STACK);
+  
   return (
     <div
       aria-live="polite"
@@ -115,6 +119,31 @@ function ToastRegion({ toasts, dismiss }: { toasts: ToastEntry[]; dismiss: (id: 
       className="pointer-events-none fixed bottom-3 right-3 z-50 flex w-[320px] flex-col gap-2"
     >
       <AnimatePresence initial={false}>
+        {hiddenCount > 0 && !expanded && (
+           <motion.div
+              layout
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.9 }}
+              className="pointer-events-auto flex items-center justify-center py-1 cursor-pointer bg-[var(--color-surface-raised)] border border-[var(--color-border-subtle)] rounded shadow text-[12px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
+              onClick={() => setExpanded(true)}
+           >
+              +{hiddenCount} more
+           </motion.div>
+        )}
+        {hiddenCount > 0 && expanded && (
+           <motion.div
+              layout
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.9 }}
+              className="pointer-events-auto flex items-center justify-center py-1 cursor-pointer bg-[var(--color-surface-raised)] border border-[var(--color-border-subtle)] rounded shadow text-[12px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
+              onClick={() => setExpanded(false)}
+           >
+              Collapse
+           </motion.div>
+        )}
+        
         {visible.map(t => (
           <ToastItem key={t.id} entry={t} dismiss={dismiss} />
         ))}
@@ -132,10 +161,11 @@ function ToastItem({ entry, dismiss }: { entry: ToastEntry; dismiss: (id: string
 
   return (
     <motion.div
+      layout
       role="status"
       initial={{ opacity: 0, x: 16 }}
       animate={{ opacity: 1, x: 0 }}
-      exit={{ opacity: 0, x: 16 }}
+      exit={{ opacity: 0, scale: 0.95 }}
       transition={{ duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }}
       className={cn(
         'pointer-events-auto flex items-start gap-2 rounded-[var(--radius-md)] border bg-[var(--color-surface-raised)]',

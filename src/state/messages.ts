@@ -16,6 +16,7 @@ export function errorMessage(code?: string, context?: any): MessageResult {
   switch (code) {
     case 'url_expired':
     case 'manifest_expired':
+    case 'awaiting_url_refresh':
       return { 
         title: 'URL Expired', 
         body: 'The download link has expired. Refresh from the source page.',
@@ -28,8 +29,17 @@ export function errorMessage(code?: string, context?: any): MessageResult {
 
 export function refusalMessage(reason?: string, context?: any): MessageResult {
   switch (reason) {
+    case 'url_expired':
+    case 'manifest_expired':
+    case 'awaiting_url_refresh':
+      return { 
+        title: 'URL Expired', 
+        body: 'The download link has expired. Refresh from the source page.',
+        recovery: { type: 'RefreshFromCurrentTab', label: 'Refresh from current tab' }
+      };
     case 'drm_detected':
     case 'encrypted_hls':
+    case 'unsupported_protected':
       return { 
         title: 'Encrypted (DRM)', 
         body: 'TuyulDM cannot download DRM protected content.', 
@@ -41,6 +51,6 @@ export function refusalMessage(reason?: string, context?: any): MessageResult {
         recovery: { type: 'OpenAdapterSettings', label: 'Open adapter settings' } 
       };
     default:
-      return { title: 'Refused', body: reason };
+      return { title: 'Failed to extract', body: reason };
   }
 }
