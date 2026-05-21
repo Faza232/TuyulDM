@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useDetection, useDownloads } from '../../state';
 import { CurrentTabHeader } from './CurrentTabHeader';
 import { CompactOfferList } from './CompactOfferList';
+import { PermissionBanner } from './PermissionBanner';
 import { Button } from '../../ui/primitives';
 import { ExternalLink, RefreshCw } from '../../ui/icons';
 import type { DetectedStreamItem } from '../../state/types';
@@ -26,6 +27,7 @@ export default function Popup() {
   return (
     <div className="flex flex-col h-full bg-[var(--color-bg)] text-[var(--color-text)]">
       <CurrentTabHeader />
+      <PermissionBanner />
       
       <div className="flex items-center justify-between p-2 pb-1">
         <Button size="sm" variant="ghost" onClick={scan} disabled={isScanning}>

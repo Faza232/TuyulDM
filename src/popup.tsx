@@ -13,6 +13,6 @@ const root = createRoot(document.getElementById('root')!);
 
 root.render(
   <StrictMode>
-    {isDev ? <Dev /> : <App surface="popup" />} 
+    {isDev ? <Dev /> : <Popup />} 
   </StrictMode>,
 );
