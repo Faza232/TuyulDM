@@ -41,5 +41,5 @@ export function useDownloads() {
     fetchDownloads();
   };
 
-  const refreshUrl = async (id: string | number) => { const download = downloads.find(d => d.id === id); if (!download) return; await bridge.refreshUrl(id, download.url || ""); fetchDownloads(); }; return { downloads, isLoading, pause, resume, cancel, refreshUrl, refresh: fetchDownloads };
+  const refreshUrl = async (id: string | number) => { const download = downloads.find(d => d.id === id); if (!download) return; await bridge.refreshUrl(id, download.url || ""); fetchDownloads(); }; const addDownload = async (url: string, filename?: string, headers?: Record<string, string>, offer?: any) => { await bridge.addDownload(url, filename, headers, offer); fetchDownloads(); }; return { downloads, isLoading, pause, resume, cancel, refreshUrl, addDownload, refresh: fetchDownloads };
 }

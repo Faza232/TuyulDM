@@ -1,21 +1,47 @@
 import { useEffect, useState } from 'react';
-import { useDetection } from '../../state/detection';
+import { useDetection, useDownloads } from '../../state';
+import { CurrentTabHeader } from './CurrentTabHeader';
+import { CompactOfferList } from './CompactOfferList';
+import { Button } from '../../ui/primitives';
+import { ExternalLink, RefreshCw } from '../../ui/icons';
+import type { DetectedStreamItem } from '../../state/types';
 
 export default function Popup() {
   const { streams, isScanning, scan } = useDetection();
+  const { addDownload } = useDownloads();
+
+  const handleDownload = async (offer: DetectedStreamItem) => {
+    await addDownload(offer.url, offer.label || 'Unknown', undefined, offer);
+    window.close(); // Close the popup
+  };
+
+  const openDashboard = () => {
+    if (typeof chrome !== 'undefined' && chrome.tabs) {
+      chrome.tabs.create({ url: 'index.html' });
+    } else {
+      window.open('index.html', '_blank');
+    }
+  };
 
   return (
-    <div className="p-4 bg-[var(--color-bg)] text-[var(--color-text)] min-h-screen">
-      <h1 className="text-xl font-bold mb-4">Popup</h1>
-      <button onClick={scan} disabled={isScanning} className="mb-4">
-        {isScanning ? 'Scanning...' : 'Scan Tab'}
-      </button>
-      <div>
-        {streams.map((s, i) => (
-          <div key={i} className="mb-2 p-2 bg-[var(--color-surface)] border border-[var(--color-border)]">
-            {s.label || s.url || 'Unknown Stream'}
-          </div>
-        ))}
+    <div className="flex flex-col h-full bg-[var(--color-bg)] text-[var(--color-text)]">
+      <CurrentTabHeader />
+      
+      <div className="flex items-center justify-between p-2 pb-1">
+        <Button size="sm" variant="ghost" onClick={scan} disabled={isScanning}>
+           <RefreshCw className={`size-3.5 mr-1.5 ${isScanning ? 'animate-spin' : ''}`} />
+           {isScanning ? 'Scanning...' : 'Scan tab'}
+        </Button>
+      </div>
+
+      <div className="flex-1 overflow-y-auto">
+        <CompactOfferList offers={streams} onDownload={handleDownload} />
+      </div>
+
+      <div className="p-2 border-t border-[var(--color-border-subtle)] bg-[var(--color-surface)]">
+        <Button size="sm" variant="ghost" className="w-full text-[var(--color-text-dim)] hover:text-[var(--color-text)]" onClick={openDashboard}>
+           Open dashboard <ExternalLink className="size-3 ml-1" />
+        </Button>
       </div>
     </div>
   );
