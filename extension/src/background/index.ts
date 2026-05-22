@@ -24,8 +24,8 @@ const SEND_HEADERS_EXTRA_INFO = typeof browser.runtime.getBrowserInfo === 'funct
   : ['requestHeaders', 'extraHeaders'];
 const DEFAULT_INTERCEPTION_SETTINGS = Object.freeze({
   enabled: true,
-  extensions: ['zip', 'iso', 'mp4', 'mkv', '7z', 'tar', 'gz'],
-  minFileSizeMB: 50,
+  extensions: [] as string[],
+  minFileSizeMB: 0,
   allowDomains: [],
   blockDomains: [],
   autoShowDetectedStreams: false,
@@ -34,6 +34,40 @@ const DEFAULT_INTERCEPTION_SETTINGS = Object.freeze({
   scheduleEndHour: 6,
   scheduleDays: [0, 1, 2, 3, 4, 5, 6],
 });
+
+const MIME_TO_EXTENSION: Record<string, string> = {
+  'application/zip': 'zip',
+  'application/x-zip-compressed': 'zip',
+  'application/x-7z-compressed': '7z',
+  'application/x-rar-compressed': 'rar',
+  'application/vnd.rar': 'rar',
+  'application/x-tar': 'tar',
+  'application/gzip': 'gz',
+  'application/x-iso9660-image': 'iso',
+  'application/pdf': 'pdf',
+  'application/octet-stream': 'bin',
+  'application/x-msdownload': 'exe',
+  'application/x-apple-diskimage': 'dmg',
+  'application/x-debian-package': 'deb',
+  'application/vnd.android.package-archive': 'apk',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'application/vnd.ms-powerpoint': 'ppt',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+  'video/mp4': 'mp4',
+  'video/x-matroska': 'mkv',
+  'video/webm': 'webm',
+  'video/quicktime': 'mov',
+  'audio/mpeg': 'mp3',
+  'audio/mp4': 'm4a',
+  'audio/flac': 'flac',
+  'audio/wav': 'wav',
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/gif': 'gif',
+};
 const FORWARDED_HEADERS = new Map([
   ['authorization', 'Authorization'],
   ['origin', 'Origin'],
@@ -41,6 +75,8 @@ const FORWARDED_HEADERS = new Map([
   ['user-agent', 'User-Agent'],
 ]);
 const DETECTED_MEDIA_TTL_MS = 5 * 60_000;
+const DOWNLOAD_EVENT_FRESHNESS_WINDOW_MS = 30_000;
+const BACKGROUND_STARTED_AT_MS = Date.now();
 
 type OverlayDownloadSchedule = {
   start_hour: number;
@@ -137,6 +173,28 @@ function isRequestableOriginUrl(rawUrl: string) {
   } catch {
     return false;
   }
+}
+
+function getRelatedOriginPatternsForUrl(rawUrl: string) {
+  try {
+    const hostname = new URL(rawUrl).hostname.toLowerCase();
+    if (hostname === 'drive.google.com' || hostname === 'docs.google.com') {
+      return ['*://drive.usercontent.google.com/*'];
+    }
+  } catch {
+    // Ignore malformed URLs.
+  }
+
+  return [] as string[];
+}
+
+function getPermissionRequestOriginsForUrl(rawUrl: string) {
+  const originPattern = getOriginPattern(rawUrl);
+  if (!originPattern || !isRequestableOriginUrl(rawUrl)) {
+    return [] as string[];
+  }
+
+  return normalizeGrantedOrigins([originPattern, ...getRelatedOriginPatternsForUrl(rawUrl)]);
 }
 
 async function getPermissionStatus(): Promise<PermissionStatusPayload> {
@@ -723,6 +781,35 @@ function getFileExtension(url: string) {
   }
 }
 
+function extensionFromFilename(name: unknown) {
+  if (typeof name !== 'string' || !name) return '';
+  const base = name.split(/[\\/]/).pop() || '';
+  const dotIndex = base.lastIndexOf('.');
+  if (dotIndex < 0) return '';
+  return normalizeExtension(base.slice(dotIndex + 1));
+}
+
+function extensionFromMime(mime: unknown) {
+  if (typeof mime !== 'string' || !mime) return '';
+  const key = mime.split(';')[0].trim().toLowerCase();
+  return MIME_TO_EXTENSION[key] || '';
+}
+
+function resolveDownloadExtension(item: any) {
+  return (
+    extensionFromFilename(item?.filename)
+    || extensionFromFilename(item?.suggestedFilename)
+    || getFileExtension(item?.finalUrl || '')
+    || getFileExtension(item?.url || '')
+    || extensionFromMime(item?.mime)
+  );
+}
+
+function resolveDownloadUrl(item: any) {
+  if (typeof item?.finalUrl === 'string' && item.finalUrl) return item.finalUrl;
+  return String(item?.url || '');
+}
+
 function getOriginPattern(url: string) {
   try {
     return `${new URL(url).origin}/*`;
@@ -731,23 +818,30 @@ function getOriginPattern(url: string) {
   }
 }
 
-async function ensureOriginPermission(url: string) {
-  const originPattern = getOriginPattern(url);
-  if (!originPattern) {
-    return false;
+function parseDownloadTimestamp(value: unknown) {
+  if (typeof value !== 'string' || !value) {
+    return 0;
   }
 
-  const hasPermission = await browserApi.permissions.contains({ origins: [originPattern] });
-  if (hasPermission) {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function isHistoricalDownloadReplay(item: any) {
+  if (item?.state === 'complete') {
     return true;
   }
 
-  try {
-    return await browserApi.permissions.request({ origins: [originPattern] });
-  } catch (error) {
-    console.warn('Origin permission request failed:', error);
-    return false;
+  if (typeof item?.endTime === 'string' && item.endTime) {
+    return true;
   }
+
+  const startedAt = parseDownloadTimestamp(item?.startTime);
+  if (startedAt > 0 && startedAt + DOWNLOAD_EVENT_FRESHNESS_WINDOW_MS < BACKGROUND_STARTED_AT_MS) {
+    return true;
+  }
+
+  return false;
 }
 
 async function hasOriginPermission(url: string) {
@@ -756,8 +850,10 @@ async function hasOriginPermission(url: string) {
     return false;
   }
 
-  return browserApi.permissions.contains({ origins: ['<all_urls>'] })
-    || browserApi.permissions.contains({ origins: [originPattern] });
+  if (await browserApi.permissions.contains({ origins: ['<all_urls>'] })) {
+    return true;
+  }
+  return browserApi.permissions.contains({ origins: [originPattern] });
 }
 
 browserApi.runtime.onInstalled?.addListener((details: any) => {
@@ -769,31 +865,49 @@ browserApi.runtime.onInstalled?.addListener((details: any) => {
 });
 
 function shouldInterceptDownload(item: any, settings: ReturnType<typeof normalizeInterceptionSettings>) {
-  if (!settings.enabled || !item?.url) {
+  const downloadUrl = resolveDownloadUrl(item);
+  if (!settings.enabled) {
+    console.log('[TuyulDM] Skip intercept: settings disabled', downloadUrl);
+    return false;
+  }
+  if (!downloadUrl) {
+    console.log('[TuyulDM] Skip intercept: no url on item', item);
     return false;
   }
 
   try {
-    const hostname = new URL(item.url).hostname.toLowerCase();
+    const parsed = new URL(downloadUrl);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      console.log('[TuyulDM] Skip intercept: non-http(s) protocol', downloadUrl);
+      return false;
+    }
+    const hostname = parsed.hostname.toLowerCase();
     if (hostnameMatches(hostname, settings.blockDomains)) {
+      console.log('[TuyulDM] Skip intercept: blocked domain', hostname);
       return false;
     }
     if (settings.allowDomains.length > 0 && !hostnameMatches(hostname, settings.allowDomains)) {
+      console.log('[TuyulDM] Skip intercept: not in allow list', hostname);
       return false;
     }
 
-    const extension = getFileExtension(item.url);
-    if (settings.extensions.length > 0 && !settings.extensions.includes(extension)) {
-      return false;
+    if (settings.extensions.length > 0) {
+      const extension = resolveDownloadExtension(item);
+      if (!extension || !settings.extensions.includes(extension)) {
+        console.log('[TuyulDM] Skip intercept: extension not in filter', { extension, url: downloadUrl, filename: item?.filename, mime: item?.mime });
+        return false;
+      }
     }
 
     const minimumBytes = settings.minFileSizeMB * 1024 * 1024;
     if (minimumBytes > 0 && typeof item.totalBytes === 'number' && item.totalBytes > 0 && item.totalBytes < minimumBytes) {
+      console.log('[TuyulDM] Skip intercept: below min size', { totalBytes: item.totalBytes, minimumBytes });
       return false;
     }
 
     return true;
-  } catch {
+  } catch (error) {
+    console.warn('[TuyulDM] Skip intercept: error evaluating download', error, downloadUrl);
     return false;
   }
 }
@@ -804,12 +918,23 @@ function getDownloadFilename(item: any) {
     return existingName;
   }
 
-  try {
-    const lastSegment = new URL(item.url).pathname.split('/').pop();
-    return lastSegment || `Download_${Date.now()}`;
-  } catch {
-    return `Download_${Date.now()}`;
+  const suggestedName = item.suggestedFilename?.split(/[\\/]/).pop();
+  if (suggestedName) {
+    return suggestedName;
   }
+
+  const sourceUrl = resolveDownloadUrl(item);
+  try {
+    const lastSegment = new URL(sourceUrl).pathname.split('/').pop();
+    if (lastSegment) {
+      return lastSegment;
+    }
+  } catch {
+    // fall through to fallback
+  }
+
+  const ext = extensionFromMime(item?.mime);
+  return ext ? `Download_${Date.now()}.${ext}` : `Download_${Date.now()}`;
 }
 
 function requestKey(url: string) {
@@ -866,6 +991,10 @@ function getCapturedRequestHeaders(url: string) {
 }
 
 async function getCookiesForUrl(url: string) {
+  if (!await hasOriginPermission(url)) {
+    return [];
+  }
+
   try {
     const cookies = await browserApi.cookies.getAll({ url });
     return cookies.map(({ name, value, domain, path }: any) => ({
@@ -1038,36 +1167,55 @@ async function interceptDownload(item: any) {
     return;
   }
 
+  if (isHistoricalDownloadReplay(item)) {
+    console.log('[TuyulDM] Skip intercept: historical or completed browser download replay', {
+      id: item?.id,
+      url: item?.url,
+      state: item?.state,
+      startTime: item?.startTime,
+      endTime: item?.endTime,
+    });
+    return;
+  }
+
+  const downloadUrl = resolveDownloadUrl(item);
   const settings = await getInterceptionSettings();
   if (!shouldInterceptDownload(item, settings)) {
     return;
   }
 
-  const permissionGranted = await ensureOriginPermission(item.url);
+  const permissionGranted = await hasOriginPermission(downloadUrl);
   if (!permissionGranted) {
-    console.warn('Skipping interception because the origin permission was not granted:', item.url);
-    return;
+    console.warn('[TuyulDM] Origin permission not granted for auto-intercept. Proceeding best-effort without site access; grant access from the popup or options page if this download needs authentication.', downloadUrl);
   }
 
-  const requestContext = await buildForwardedRequestContext(item.url, item.referrer);
+  console.log('[TuyulDM] Intercepting download', { url: downloadUrl, filename: item?.filename, mime: item?.mime });
+
+  const requestContext = await buildForwardedRequestContext(downloadUrl, item.referrer);
   try {
     await sendHostRequest('download.add', {
       id: createDownloadRequestId(),
-      url: item.url,
+      url: downloadUrl,
       filename: getDownloadFilename(item),
       schedule: buildInterceptionSchedule(settings),
       headers: requestContext.headers,
       cookies: requestContext.cookies,
     });
   } catch (error) {
-    console.error('Failed to hand off download to native host:', error);
+    console.error('[TuyulDM] Failed to hand off download to native host:', error);
     return;
   }
 
   try {
     await browserApi.downloads.cancel(item.id);
   } catch (error) {
-    console.warn('Failed to cancel browser download:', error);
+    console.warn('[TuyulDM] Failed to cancel browser download:', error);
+  }
+
+  try {
+    await browserApi.downloads.erase({ id: item.id });
+  } catch (error) {
+    console.warn('[TuyulDM] Failed to erase browser download record:', error);
   }
 }
 
@@ -1236,12 +1384,14 @@ browserApi.runtime.onMessage.addListener(((message: any, sender: any, sendRespon
   }
 
   if (message.type === 'REQUEST_CURRENT_TAB_PERMISSION') {
-    getPermissionStatus()
-      .then(async (status) => {
-        if (!status.currentOriginPattern || !status.canRequestCurrentOrigin) {
+    Promise.all([getPermissionStatus(), getActiveTab()])
+      .then(async ([status, tab]) => {
+        const currentUrl = typeof tab?.url === 'string' ? tab.url : '';
+        const requestOrigins = getPermissionRequestOriginsForUrl(currentUrl);
+        if (requestOrigins.length === 0 || !status.currentOriginPattern || !status.canRequestCurrentOrigin) {
           return { granted: false, status };
         }
-        const granted = await browserApi.permissions.request({ origins: [status.currentOriginPattern] });
+        const granted = await browserApi.permissions.request({ origins: requestOrigins });
         return { granted, status: await broadcastPermissionStatus() };
       })
       .then((result: any) => sendResponse(result))

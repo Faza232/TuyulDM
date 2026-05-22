@@ -41,6 +41,13 @@ type DownloadState struct {
 	Segments            []Segment         `json:"segments"`
 	Schedule            *DownloadSchedule `json:"schedule,omitempty"`
 	WasUserPaused       bool              `json:"was_user_paused,omitempty"`
+	ExtractionStrategy  string            `json:"extraction_strategy,omitempty"`
+	SiteKey             string            `json:"site_key,omitempty"`
+	OfferTitle          string            `json:"offer_title,omitempty"`
+	OfferDebug          map[string]string `json:"offer_debug,omitempty"`
+	TrackCount          int               `json:"track_count,omitempty"`
+	AssemblyStage       string            `json:"assembly_stage,omitempty"`
+	Plan                *DownloadPlan     `json:"plan,omitempty"`
 }
 
 type DownloadSchedule struct {

@@ -12,6 +12,7 @@ import (
 	"hash"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
@@ -56,6 +57,7 @@ type DownloadRequest struct {
 
 type downloadMetadata struct {
 	FinalURL     string
+	Filename     string
 	TotalSize    int64
 	AcceptRanges bool
 	ContentMD5   string
@@ -69,6 +71,9 @@ func (m downloadMetadata) hasValidators() bool {
 }
 
 func mergeProbeMetadata(primary downloadMetadata, fallback downloadMetadata) downloadMetadata {
+	if primary.Filename == "" {
+		primary.Filename = fallback.Filename
+	}
 	if primary.ContentMD5 == "" {
 		primary.ContentMD5 = fallback.ContentMD5
 	}
@@ -543,7 +548,14 @@ func (e *Engine) Add(ctx context.Context, req DownloadRequest) (*DownloadState, 
 		Schedule:       cloneDownloadSchedule(req.Schedule),
 	}
 
-	if err := e.assignDownloadTargetAndSave(state, req.Filename); err != nil {
+	requestedFilename := req.Filename
+	if shouldPreferProbedFilename(requestedFilename, metadata.Filename) {
+		requestedFilename = metadata.Filename
+	} else if shouldPreferProbedFilename(requestedFilename, filenameHintFromURL(metadata.FinalURL)) {
+		requestedFilename = filenameHintFromURL(metadata.FinalURL)
+	}
+
+	if err := e.assignDownloadTargetAndSave(state, requestedFilename); err != nil {
 		return nil, err
 	}
 	if !metadata.hasValidators() {
@@ -638,6 +650,51 @@ func (e *Engine) Start(id string) error {
 
 	e.drainQueue()
 	return nil
+}
+
+func cleanupEmptyOutputOnURLExpired(a *ActiveDownload, segmentIndex int, statusCode int) {
+	if a == nil || a.State == nil {
+		return
+	}
+
+	a.mu.Lock()
+	currentBytes := downloadedBytes(a.State)
+	outputPath := downloadPath(a.State)
+	downloadID := a.State.ID
+	requestURL := a.State.URL
+	if currentBytes == 0 && a.File != nil {
+		_ = a.File.Close()
+		a.File = nil
+	}
+	a.mu.Unlock()
+
+	if currentBytes > 0 || strings.TrimSpace(outputPath) == "" {
+		return
+	}
+
+	if err := os.Remove(outputPath); err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		slog.Warn("url expired cleanup failed",
+			"download_id", downloadID,
+			"url", requestURL,
+			"output_path", outputPath,
+			"segment_index", segmentIndex,
+			"status_code", statusCode,
+			"error", err,
+		)
+		return
+	}
+
+	slog.Info("url expired cleanup removed empty output",
+		"download_id", downloadID,
+		"url", requestURL,
+		"output_path", outputPath,
+		"segment_index", segmentIndex,
+		"status_code", statusCode,
+		"event", "url_expired_cleanup",
+	)
 }
 
 func (e *Engine) runDownload(a *ActiveDownload) {
@@ -737,6 +794,7 @@ func (e *Engine) runDownload(a *ActiveDownload) {
 	var expiredErr *urlExpiredError
 	if errors.As(lastError, &expiredErr) {
 		e.releaseActiveSlot(a.State.ID)
+		cleanupEmptyOutputOnURLExpired(a, expiredErr.SegmentIndex, expiredErr.StatusCode)
 
 		a.mu.Lock()
 		setDownloadAwaitingURLRefresh(a.State, "Link expired. Refresh URL to keep your progress.")
@@ -1811,6 +1869,7 @@ func metadataFromResponse(finalURL string, resp *http.Response) downloadMetadata
 
 	return downloadMetadata{
 		FinalURL:     finalURL,
+		Filename:     filenameFromContentDisposition(resp.Header.Get("Content-Disposition")),
 		TotalSize:    totalSize,
 		AcceptRanges: acceptRanges,
 		ContentMD5:   strings.TrimSpace(resp.Header.Get("Content-MD5")),
@@ -1818,6 +1877,79 @@ func metadataFromResponse(finalURL string, resp *http.Response) downloadMetadata
 		ETag:         resp.Header.Get("ETag"),
 		LastModified: resp.Header.Get("Last-Modified"),
 	}
+}
+
+func filenameFromContentDisposition(headerValue string) string {
+	value := strings.TrimSpace(headerValue)
+	if value == "" {
+		return ""
+	}
+
+	_, params, err := mime.ParseMediaType(value)
+	if err != nil {
+		return ""
+	}
+
+	if filename := cleanFilenameHint(params["filename"]); filename != "" {
+		return filename
+	}
+	if filename := cleanFilenameHint(params["filename*"]); filename != "" {
+		return filename
+	}
+	return ""
+}
+
+func cleanFilenameHint(name string) string {
+	value := strings.TrimSpace(name)
+	if value == "" {
+		return ""
+	}
+
+	value = strings.ReplaceAll(value, "\\", "/")
+	base := strings.TrimSpace(path.Base(value))
+	if base == "" || base == "." || base == "/" {
+		return ""
+	}
+	return base
+}
+
+func isGenericDownloadFilename(name string) bool {
+	base := strings.ToLower(cleanFilenameHint(name))
+	if base == "" {
+		return false
+	}
+
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	if stem == "download" {
+		return true
+	}
+	if !strings.HasPrefix(stem, "download (") || !strings.HasSuffix(stem, ")") {
+		return false
+	}
+
+	suffix := strings.TrimSuffix(strings.TrimPrefix(stem, "download ("), ")")
+	if suffix == "" {
+		return false
+	}
+	_, err := strconv.Atoi(suffix)
+	return err == nil
+}
+
+func shouldPreferProbedFilename(requestedName string, probedName string) bool {
+	if cleanFilenameHint(probedName) == "" || isGenericDownloadFilename(probedName) {
+		return false
+	}
+	requested := cleanFilenameHint(requestedName)
+	return requested == "" || isGenericDownloadFilename(requested)
+}
+
+func filenameHintFromURL(rawURL string) string {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return cleanFilenameHint(path.Base(parsedURL.Path))
 }
 
 func parseContentRangeTotal(contentRange string) (int64, error) {
