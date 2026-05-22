@@ -15,7 +15,8 @@ export function useDownloads() {
 
   const fetchDownloads = useCallback(async () => {
     try {
-      const data = await bridge.getDownloads();
+      const resp = await bridge.getDownloads();
+      const data = Array.isArray(resp) ? resp : [];
 
       // Compare and emit toasts for new errors
       data.forEach(d => {
