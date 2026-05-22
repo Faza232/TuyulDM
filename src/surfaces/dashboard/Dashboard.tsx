@@ -1,7 +1,9 @@
-import { useState, useEffect } from 'react';
-import { useDownloads, useDetection, useSettings, useUISettings } from '../../state';
+import { useEffect } from 'react';
+import { useDownloads, useDetection } from '../../state';
+import { useUISettings, useUISettingsStore } from '../../state/ui_settings';
 import { useCommands } from '../../state/commands';
 import { useShortcuts } from '../../state/shortcuts';
+import { useDialogs } from '../../state/dialogs';
 import { AppSidebar, type AppRoute } from './Sidebar';
 import { TopBar } from './TopBar';
 
@@ -12,61 +14,55 @@ import LogsRoute from './routes/Logs';
 
 import { CommandPalette } from '../../ui/primitives/CommandPalette';
 import { ShortcutsDialog } from '../../ui/ShortcutsDialog';
+import { AddUrlDialog } from './components/AddUrlDialog';
+import { ConfirmDialog } from './components/ConfirmDialog';
 
-// Temporary shim for the 'surface' prop
-export default function Dashboard({ surface = 'dashboard' }: { surface?: 'dashboard' | 'popup' | 'options' }) {
-  const [activeRoute, setActiveRoute] = useState<AppRoute>(() => {
-    const saved = localStorage.getItem('tuyuldm.route');
-    return (saved as AppRoute) || 'queue';
-  });
+const ROUTES: AppRoute[] = ['queue', 'finished', 'grabber', 'logs', 'settings'];
+function isRoute(v: unknown): v is AppRoute {
+  return typeof v === 'string' && (ROUTES as readonly string[]).includes(v);
+}
 
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
-    return localStorage.getItem('tuyuldm.sidebar') === '1';
-  });
-  
-  const [showShortcuts, setShowShortcuts] = useState(false);
+export default function Dashboard() {
+  const { uiSettings, updateUISettings } = useUISettings();
+  const activeRoute: AppRoute = isRoute(uiSettings.route) ? uiSettings.route : 'queue';
+  const sidebarCollapsed = uiSettings.sidebarCollapsed;
+  const showShortcuts = uiSettings.shortcutsOpen;
 
-  const { updateUISettings } = useUISettings();
+  const setActiveRoute = (r: AppRoute) => updateUISettings({ route: r });
+  const setShowShortcuts = (v: boolean) => updateUISettings({ shortcutsOpen: v });
+  const toggleSidebar = () => updateUISettings({ sidebarCollapsed: !sidebarCollapsed });
+
   const { downloads } = useDownloads();
   const { streams } = useDetection();
-  
+
   const { commands, registerCommands, open: paletteOpen, setOpen: setPaletteOpen, toggleOpen: togglePaletteOpen } = useCommands();
-
-  useEffect(() => {
-    localStorage.setItem('tuyuldm.route', activeRoute);
-  }, [activeRoute]);
-
-  const toggleSidebar = () => {
-    const next = !sidebarCollapsed;
-    setSidebarCollapsed(next);
-    localStorage.setItem('tuyuldm.sidebar', next ? '1' : '0');
-  };
+  const { addUrlOpen, openAddUrl, closeAddUrl } = useDialogs();
 
   useShortcuts([
     { key: 'k', meta: true, description: 'Command palette', handler: togglePaletteOpen },
     { key: 'k', ctrl: true, description: 'Command palette', handler: togglePaletteOpen },
     { key: '[', description: 'Toggle sidebar', handler: toggleSidebar },
     { key: '?', description: 'Show shortcuts', handler: () => setShowShortcuts(true) },
-    // Route jumps
-    { key: 'q', description: 'Go to queue', handler: (e) => { setActiveRoute('queue'); } }, // simplified
-    { key: 'f', description: 'Go to finished', handler: (e) => { setActiveRoute('finished'); } },
-    { key: 'g', description: 'Go to grabber', handler: (e) => { setActiveRoute('grabber'); } }
+    { key: 'q', description: 'Go to queue', handler: () => setActiveRoute('queue') },
+    { key: 'f', description: 'Go to finished', handler: () => setActiveRoute('finished') },
+    { key: 'g', description: 'Go to grabber', handler: () => setActiveRoute('grabber') },
   ]);
 
   useEffect(() => {
     return registerCommands([
       { id: 'global:palette', label: 'Command Palette', description: 'Open command palette', shortcut: ['⌘', 'K'], onSelect: () => setPaletteOpen(true) },
-      { id: 'view:sidebar', label: 'Toggle Sidebar', description: 'Expand or collapse sidebar', shortcut: ['['], onSelect: toggleSidebar },
-      { id: 'view:shortcuts', label: 'Keyboard Shortcuts', description: 'Show cheat sheet', shortcut: ['?'], onSelect: () => setShowShortcuts(true) },
-      { id: 'nav:queue', label: 'Go to Queue', group: 'Navigation', shortcut: ['g', 'q'], onSelect: () => setActiveRoute('queue') },
-      { id: 'nav:finished', label: 'Go to Finished', group: 'Navigation', shortcut: ['g', 'f'], onSelect: () => setActiveRoute('finished') },
-      { id: 'nav:grabber', label: 'Go to Video Grabber', group: 'Navigation', shortcut: ['g', 'g'], onSelect: () => setActiveRoute('grabber') },
-      { id: 'nav:logs', label: 'Go to Logs', group: 'Navigation', onSelect: () => setActiveRoute('logs') },
+      { id: 'global:add-url', label: 'Add URL', description: 'Queue a media URL', shortcut: ['n'], onSelect: openAddUrl },
+      { id: 'view:sidebar', label: 'Toggle Sidebar', description: 'Expand or collapse sidebar', shortcut: ['['], onSelect: () => updateUISettings({ sidebarCollapsed: !useUISettingsStore.getState().uiSettings.sidebarCollapsed }) },
+      { id: 'view:shortcuts', label: 'Keyboard Shortcuts', description: 'Show cheat sheet', shortcut: ['?'], onSelect: () => updateUISettings({ shortcutsOpen: true }) },
+      { id: 'nav:queue', label: 'Go to Queue', group: 'Navigation', shortcut: ['g', 'q'], onSelect: () => updateUISettings({ route: 'queue' }) },
+      { id: 'nav:finished', label: 'Go to Finished', group: 'Navigation', shortcut: ['g', 'f'], onSelect: () => updateUISettings({ route: 'finished' }) },
+      { id: 'nav:grabber', label: 'Go to Video Grabber', group: 'Navigation', shortcut: ['g', 'g'], onSelect: () => updateUISettings({ route: 'grabber' }) },
+      { id: 'nav:logs', label: 'Go to Logs', group: 'Navigation', onSelect: () => updateUISettings({ route: 'logs' }) },
       { id: 'nav:settings', label: 'Open Settings', group: 'Navigation', onSelect: () => window.open(chrome.runtime.getURL('options.html')) },
       { id: 'sys:density:cozy', label: 'Density: Cozy', group: 'System', onSelect: () => updateUISettings({ density: 'cozy' }) },
-      { id: 'sys:density:compact', label: 'Density: Compact', group: 'System', onSelect: () => updateUISettings({ density: 'compact' }) }
+      { id: 'sys:density:compact', label: 'Density: Compact', group: 'System', onSelect: () => updateUISettings({ density: 'compact' }) },
     ]);
-  }, []);
+  }, [registerCommands, setPaletteOpen, openAddUrl, updateUISettings]);
 
   const activeDownloads = downloads.filter(d => ['downloading', 'queued', 'muxing'].includes(d.status)).length;
   const finishedDownloads = downloads.filter(d => d.status === 'finished').length;
@@ -74,17 +70,16 @@ export default function Dashboard({ surface = 'dashboard' }: { surface?: 'dashbo
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[var(--color-bg)] text-[var(--color-text)]">
-      <AppSidebar 
-        collapsed={sidebarCollapsed} 
-        activeRoute={activeRoute} 
+      <AppSidebar
+        collapsed={sidebarCollapsed}
+        activeRoute={activeRoute}
         onRouteChange={setActiveRoute}
         counts={{ queue: activeDownloads, finished: finishedDownloads, grabber: grabberStreams }}
       />
       <div className="flex flex-1 flex-col overflow-hidden">
-        <TopBar 
+        <TopBar
           activeRoute={activeRoute}
-          onAddUrl={() => alert('TODO: Add URL flow')}
-          onSearch={(q) => console.log('Search:', q)}
+          onAddUrl={openAddUrl}
           toggleSidebar={toggleSidebar}
         />
         <main className="flex-1 overflow-auto bg-[var(--color-bg)]">
@@ -95,14 +90,11 @@ export default function Dashboard({ surface = 'dashboard' }: { surface?: 'dashbo
           {activeRoute === 'settings' && <div className="p-4">Settings handled via popup</div>}
         </main>
       </div>
-      
-      <CommandPalette 
-        open={paletteOpen} 
-        onClose={() => setPaletteOpen(false)} 
-        items={commands} 
-      />
-      
+
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} items={commands} />
       <ShortcutsDialog open={showShortcuts} onClose={() => setShowShortcuts(false)} />
+      <AddUrlDialog open={addUrlOpen} onClose={closeAddUrl} />
+      <ConfirmDialog />
     </div>
   );
 }

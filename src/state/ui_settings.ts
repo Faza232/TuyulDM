@@ -1,60 +1,67 @@
-import { useState, useEffect } from 'react';
+import { useEffect } from 'react';
+import { create } from 'zustand';
+import { persist, createJSONStorage } from 'zustand/middleware';
 
 export type Density = 'cozy' | 'compact';
+export type AppRoute = 'queue' | 'finished' | 'grabber' | 'logs' | 'settings';
 
 export interface UISettings {
   density: Density;
   accent: string;
+  route: AppRoute;
+  sidebarCollapsed: boolean;
+  shortcutsOpen: boolean;
 }
 
 const DEFAULT_SETTINGS: UISettings = {
   density: 'cozy',
-  accent: '#FAFAFA'
+  accent: '#FAFAFA',
+  route: 'queue',
+  sidebarCollapsed: false,
+  shortcutsOpen: false,
 };
 
+interface Store {
+  uiSettings: UISettings;
+  updateUISettings: (patch: Partial<UISettings>) => void;
+}
+
+export const useUISettingsStore = create<Store>()(
+  persist(
+    (set) => ({
+      uiSettings: DEFAULT_SETTINGS,
+      updateUISettings: (patch) =>
+        set((s) => ({ uiSettings: { ...s.uiSettings, ...patch } })),
+    }),
+    {
+      name: 'tuyul_ui_settings',
+      storage: createJSONStorage(() => localStorage),
+      partialize: (s) => ({
+        uiSettings: {
+          density: s.uiSettings.density,
+          accent: s.uiSettings.accent,
+          route: s.uiSettings.route,
+          sidebarCollapsed: s.uiSettings.sidebarCollapsed,
+        },
+      }),
+      merge: (persisted, current) => {
+        const p = (persisted as Partial<Store> | undefined)?.uiSettings ?? {};
+        return {
+          ...current,
+          uiSettings: { ...DEFAULT_SETTINGS, ...p, shortcutsOpen: false },
+        };
+      },
+    },
+  ),
+);
+
 export function useUISettings() {
-  const [settings, setSettings] = useState<UISettings>(DEFAULT_SETTINGS);
+  const uiSettings = useUISettingsStore((s) => s.uiSettings);
+  const updateUISettings = useUISettingsStore((s) => s.updateUISettings);
 
   useEffect(() => {
-    const saved = localStorage.getItem('tuyul_ui_settings');
-    if (saved) {
-      try {
-        setSettings({ ...DEFAULT_SETTINGS, ...JSON.parse(saved) });
-      } catch (e) {}
-    }
-  }, []);
+    document.documentElement.setAttribute('data-density', uiSettings.density);
+  }, [uiSettings.density]);
 
-  const updateSettings = (updates: Partial<UISettings>) => {
-    setSettings(prev => {
-      const next = { ...prev, ...updates };
-      localStorage.setItem('tuyul_ui_settings', JSON.stringify(next));
-      window.dispatchEvent(new Event('tuyul_ui_settings_changed'));
-      return next;
-    });
-  };
-
-  useEffect(() => {
-    const handleSync = () => {
-      const saved = localStorage.getItem('tuyul_ui_settings');
-      if (saved) {
-        try {
-          const s = { ...DEFAULT_SETTINGS, ...JSON.parse(saved) };
-          setSettings(s);
-        } catch (e) {}
-      }
-    };
-    window.addEventListener('tuyul_ui_settings_changed', handleSync);
-    window.addEventListener('storage', (e) => {
-        if (e.key === 'tuyul_ui_settings') handleSync();
-    });
-    // Apply body classes
-    document.documentElement.setAttribute('data-density', settings.density);
-    
-    return () => {
-      window.removeEventListener('tuyul_ui_settings_changed', handleSync);
-      window.removeEventListener('storage', handleSync);
-    };
-  }, [settings.density]);
-
-  return { uiSettings: settings, updateUISettings: updateSettings };
+  return { uiSettings, updateUISettings };
 }

@@ -1,11 +1,20 @@
-import type { 
-  DownloadItem, HostStats, HostStatus, HostSettings, 
+import type {
+  DownloadItem, HostStats, HostStatus, HostSettings,
   InterceptionSettings, PermissionStatus, DetectedStreamItem,
   RefreshUrlResponse, ActiveTabUrlResponse
 } from './types';
+import type { MediaOffer } from '../../extension/src/shared/media_classify';
 
-export function getChromeRuntime() {
-  const runtime = (window as any).browser?.runtime ?? (window as any).chrome?.runtime;
+interface RuntimeLike {
+  sendMessage: (msg: unknown) => Promise<unknown>;
+}
+
+export function getChromeRuntime(): RuntimeLike | null {
+  const w = window as unknown as {
+    browser?: { runtime?: RuntimeLike };
+    chrome?: { runtime?: RuntimeLike };
+  };
+  const runtime = w.browser?.runtime ?? w.chrome?.runtime;
   return runtime?.sendMessage ? runtime : null;
 }
 
@@ -13,12 +22,12 @@ export function isExtensionRuntimeAvailable() {
   return !!getChromeRuntime();
 }
 
-export async function sendExtensionMessage<T = any>(message: Record<string, unknown>): Promise<T | undefined> {
+export async function sendExtensionMessage<T = unknown>(message: Record<string, unknown>): Promise<T | undefined> {
   const runtime = getChromeRuntime();
   if (!runtime) {
     return undefined;
   }
-  return runtime.sendMessage(message);
+  return runtime.sendMessage(message) as Promise<T | undefined>;
 }
 
 // Single typed client
@@ -32,7 +41,7 @@ export const bridge = {
     return fetch('/api/downloads').then((r) => r.json());
   },
   
-  async addDownload(url: string, filename?: string, headers?: Record<string, string>, offer?: any): Promise<boolean> {
+  async addDownload(url: string, filename?: string, headers?: Record<string, string>, offer?: Partial<MediaOffer>): Promise<boolean> {
     if (isExtensionRuntimeAvailable()) {
       const response = await sendExtensionMessage<{ success?: boolean }>({ 
         type: 'ADD_DOWNLOAD', 

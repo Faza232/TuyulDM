@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main, fix]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ui:
+    name: UI typecheck + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+  host:
+    name: Native host
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: native-host
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: native-host/go.sum
+      - run: go vet ./...
+      - run: go test -race ./...

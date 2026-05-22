@@ -1,7 +1,8 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 
-import App from './App';
+import { AppRoot } from './AppRoot';
+import Dashboard from './surfaces/dashboard/Dashboard';
 import Dev from './ui/_dev';
 import './index.css';
 
@@ -12,6 +13,6 @@ const root = createRoot(document.getElementById('root')!);
 
 root.render(
   <StrictMode>
-    {isDev ? <Dev /> : <App surface="dashboard" />}
+    <AppRoot>{isDev ? <Dev /> : <Dashboard />}</AppRoot>
   </StrictMode>,
 );

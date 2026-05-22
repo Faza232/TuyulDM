@@ -10,8 +10,13 @@ import { StorageSection } from './sections/Storage';
 import { LoggingSection } from './sections/Logging';
 import { AboutSection } from './sections/About';
 
+const VALID_TABS = ['general', 'detection', 'network', 'adapters', 'storage', 'logging', 'about'];
+
 export default function Options() {
-  const [activeTab, setActiveTab] = useState('general');
+  const [activeTab, setActiveTab] = useState(() => {
+    const t = new URLSearchParams(window.location.search).get('tab');
+    return t && VALID_TABS.includes(t) ? t : 'general';
+  });
   const [searchQuery, setSearchQuery] = useState('');
 
   return (
@@ -30,7 +35,7 @@ export default function Options() {
              placeholder="Search settings..."
              value={searchQuery}
              onChange={e => setSearchQuery(e.target.value)}
-             className="w-full h-8 pl-8 pr-3 bg-white/5 border border-[var(--color-border)] rounded-[var(--radius-sm)] text-[12px] placeholder:text-[var(--color-text-dim)] focus:outline-none focus:border-[var(--color-accent)] transition-colors"
+             className="w-full h-8 pl-8 pr-3 bg-[var(--color-surface-raised)] border border-[var(--color-border)] rounded-[var(--radius-sm)] text-[12px] placeholder:text-[var(--color-text-dim)] focus:outline-none focus:border-[var(--color-accent)] transition-colors"
            />
          </div>
       </header>

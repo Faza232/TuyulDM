@@ -53,24 +53,6 @@
   background: #555;
 }
 
-/* Legacy ad-hoc classes — used by src/App.tsx until Phase Y replaces it.
-   Slated for removal in Phase AG once App.tsx is deleted. */
-.data-row {
-  @apply transition-all duration-150 cursor-pointer rounded-lg border border-transparent;
-}
-
-.data-row:hover {
-  @apply bg-white/5 border-white/10;
-}
-
-.col-header {
-  @apply text-[10px] font-medium text-white/40 uppercase tracking-widest;
-}
-
-.data-value {
-  @apply font-mono text-[13px] text-white/60 tracking-tight;
-}
-
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

@@ -1,8 +1,0 @@
-after I try it myself there is many thing that should be fixed, create BUILD_PLAN_2.md to fix this
-add logging for error download.
-the finished download cannot be located anywhere.
-video grabber are not clickable and cannot detect video in browser.
-user expect to choose download result directory, and the existing download directory is unclear.
-user expect to open the download result in folder or open it directly.
-user expect after clicking remove button user can choose to remove the item entirely from storage or only remove from the list/database.
-and find the other bug or error

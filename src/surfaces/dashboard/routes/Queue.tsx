@@ -1,9 +1,10 @@
 import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { useDownloads, useUISettings } from '../../../state';
+import { useDownloads, useUISettings, bridge } from '../../../state';
 import { useCommands } from '../../../state/commands';
 import { useShortcuts } from '../../../state/shortcuts';
-import { EmptyState } from '../../../ui/primitives';
+import { useDialogs } from '../../../state/dialogs';
+import { EmptyState, useToast } from '../../../ui/primitives';
 import { Download as QueueIcon } from '../../../ui/icons';
 import { DownloadRow } from '../components/DownloadRow';
 import { DownloadDetailsDrawer } from '../components/DownloadDetailsDrawer';
@@ -12,9 +13,11 @@ import type { DownloadItem } from '../../../state/types';
 export default function QueueRoute() {
   const { downloads, refreshUrl, pause, resume, cancel } = useDownloads();
   const { uiSettings } = useUISettings();
+  const { openAddUrl, requestConfirm } = useDialogs();
+  const { push } = useToast();
   const [selectedId, setSelectedId] = useState<string | number | null>(null);
   const [detailsId, setDetailsId] = useState<string | number | null>(null);
-  
+
   const { registerCommands } = useCommands();
 
   const activeDownloads = downloads.filter(d => 
@@ -72,10 +75,19 @@ export default function QueueRoute() {
       key: 'Delete',
       description: 'Cancel focused row',
       handler: () => {
-        if (selectedId && confirm('Cancel selected download?')) {
-          cancel(selectedId);
-          setSelectedId(null);
-        }
+        if (!selectedId) return;
+        const target = selectedId;
+        requestConfirm({
+          title: 'Cancel download?',
+          body: 'Partial files will be cleaned up.',
+          confirmLabel: 'Cancel download',
+          cancelLabel: 'Keep',
+          tone: 'danger',
+          onConfirm: () => {
+            cancel(target);
+            setSelectedId(null);
+          },
+        });
       }
     }
   ]);
@@ -103,9 +115,12 @@ export default function QueueRoute() {
     }
   };
 
-  const handleOpenFolder = (id: string | number) => {
-    console.log('Open folder for', id);
-    // TODO: implement call via bridge
+  const handleOpenFolder = async (id: string | number) => {
+    try {
+      await bridge.revealDownloadInFolder(id);
+    } catch (e) {
+      push({ tone: 'danger', title: 'Could not open folder', body: String((e as Error)?.message ?? e) });
+    }
   };
 
   const handleRefreshUrl = (id: string | number) => {
@@ -118,7 +133,7 @@ export default function QueueRoute() {
         <EmptyState
           icon={<QueueIcon className="size-8" />}
           title="Queue is empty"
-          action={<button onClick={() => alert("TODO")} className="text-[var(--color-accent)] hover:underline">Add URL</button>}
+          action={<button onClick={openAddUrl} className="text-[var(--color-accent)] hover:underline">Add URL</button>}
         />
       </div>
     );

@@ -1,5 +1,4 @@
-import { useState } from 'react';
-import { Search, Plus, Menu as MenuIcon, MoreHorizontal, Monitor } from '../../ui/icons';
+import { Plus, Search, Menu as MenuIcon, MoreHorizontal, Monitor } from '../../ui/icons';
 import { Button, IconButton, Input, Toolbar, ToolbarSpacer, Kbd, Menu } from '../../ui/primitives';
 import type { AppRoute } from './Sidebar';
 import { useCommands } from '../../state/commands';
@@ -8,7 +7,6 @@ import { useUISettings } from '../../state/ui_settings';
 interface TopBarProps {
   activeRoute: AppRoute;
   onAddUrl: () => void;
-  onSearch: (q: string) => void;
   toggleSidebar: () => void;
 }
 
@@ -20,7 +18,7 @@ const routeTitles: Record<AppRoute, string> = {
   settings: 'Settings'
 };
 
-export function TopBar({ activeRoute, onAddUrl, onSearch, toggleSidebar }: TopBarProps) {
+export function TopBar({ activeRoute, onAddUrl, toggleSidebar }: TopBarProps) {
   const { setOpen: setPaletteOpen } = useCommands();
   const { uiSettings, updateUISettings } = useUISettings();
 
