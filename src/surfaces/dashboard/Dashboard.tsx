@@ -35,7 +35,11 @@ export default function Dashboard() {
   const { downloads } = useDownloads();
   const { streams } = useDetection();
 
-  const { commands, registerCommands, open: paletteOpen, setOpen: setPaletteOpen, toggleOpen: togglePaletteOpen } = useCommands();
+  const commands = useCommands((s) => s.commands);
+  const registerCommands = useCommands((s) => s.registerCommands);
+  const paletteOpen = useCommands((s) => s.open);
+  const setPaletteOpen = useCommands((s) => s.setOpen);
+  const togglePaletteOpen = useCommands((s) => s.toggleOpen);
   const { addUrlOpen, openAddUrl, closeAddUrl } = useDialogs();
 
   useShortcuts([

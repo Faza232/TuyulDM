@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { useDownloads, useUISettings, bridge } from '../../../state';
 import { useCommands } from '../../../state/commands';
@@ -11,18 +11,21 @@ import { DownloadDetailsDrawer } from '../components/DownloadDetailsDrawer';
 import type { DownloadItem } from '../../../state/types';
 
 export default function QueueRoute() {
-  const { downloads, refreshUrl, pause, resume, cancel } = useDownloads();
+  const { pause, resume, cancel } = useDownloads();
+  // We use a selector here so we don't subscribe to all command state changes
+  const registerCommands = useCommands(s => s.registerCommands);
+  const downloads = useDownloads(s => s.downloads);
+
   const { uiSettings } = useUISettings();
   const { openAddUrl, requestConfirm } = useDialogs();
   const { push } = useToast();
   const [selectedId, setSelectedId] = useState<string | number | null>(null);
   const [detailsId, setDetailsId] = useState<string | number | null>(null);
 
-  const { registerCommands } = useCommands();
-
-  const activeDownloads = downloads.filter(d => 
-    ['downloading', 'queued', 'muxing', 'error', 'paused', 'awaiting_url_refresh'].includes(d.status)
-  );
+  const activeDownloads = useMemo(() => 
+    downloads.filter(d => 
+      ['downloading', 'queued', 'muxing', 'error', 'paused', 'awaiting_url_refresh'].includes(d.status)
+    ), [downloads]);
 
   const selectedDownload = downloads.find(d => d.id === detailsId) || null;
   const focusedDownload = downloads.find(d => d.id === selectedId) || null;
