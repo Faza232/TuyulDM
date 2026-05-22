@@ -11,10 +11,9 @@ import { DownloadDetailsDrawer } from '../components/DownloadDetailsDrawer';
 import type { DownloadItem } from '../../../state/types';
 
 export default function QueueRoute() {
-  const { pause, resume, cancel } = useDownloads();
+  const { downloads, refreshUrl, pause, resume, cancel } = useDownloads();
   // We use a selector here so we don't subscribe to all command state changes
   const registerCommands = useCommands(s => s.registerCommands);
-  const downloads = useDownloads(s => s.downloads);
 
   const { uiSettings } = useUISettings();
   const { openAddUrl, requestConfirm } = useDialogs();
