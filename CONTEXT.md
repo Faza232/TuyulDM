@@ -74,8 +74,8 @@ The internal vocabulary leans into the tuyul metaphor:
 │  │  - manifest sniffer  │   │  stdin/ │  │  │ Pawang (engine)  │  │  │
 │  └──────────────────────┘   │  stdout)│  │  │  - segmenter     │  │  │
 │  ┌──────────────────────┐   │         │  │  │  - tuyul pool    │  │  │
-│  │ popup / options UI   │   │         │  │  │  - resumer       │  │  │
-│  │  (React + Tailwind)  │   │         │  │  └──────────────────┘  │  │
+│  │ dashboard/popup/opts │   │         │  │  │  - resumer       │  │  │
+│  │ shared primitives+UI │   │         │  │  └──────────────────┘  │  │
 │  └──────────────────────┘   │         │  ┌──────────────────────┐  │  │
 │  ┌──────────────────────┐   │         │  │ Scheduler / queue    │  │  │
 │  │ page overlay         │   │         │  └──────────────────────┘  │  │
@@ -108,7 +108,7 @@ The internal vocabulary leans into the tuyul metaphor:
 
 | Layer        | Choice                                                                                               | Rationale                                                                                             |
 | ------------ | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Extension    | TypeScript + React + Tailwind, Manifest V3                                                           | Standard MV3 stack; works on Chrome/Brave and Firefox MV3.                                            |
+| Extension    | TypeScript + React + Tailwind, Manifest V3; shared primitive library + typed state core across three surfaces (dashboard / popup / options) | Standard MV3 stack; works on Chrome/Brave and Firefox MV3.                                            |
 | Build        | Vite + `@crxjs/vite-plugin`                                                                          | Fast HMR for extension dev, single config for both targets.                                           |
 | Native host  | **Go** (1.23+)                                                                                       | Single static binary per OS, strong stdlib HTTP, easy goroutines for segments, trivial cross-compile. |
 | Storage      | BoltDB (embedded KV) or SQLite via modernc                                                           | No external DB; portable; fits a single-user daemon.                                                  |

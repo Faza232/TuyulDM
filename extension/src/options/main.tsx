@@ -1,11 +1,3 @@
-import { StrictMode } from 'react';
-import { createRoot } from 'react-dom/client';
-
-import App from '../../../src/App.tsx';
-import '../../../src/index.css';
-
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App surface="options" />
-  </StrictMode>,
-);
+// Options entry shim. Real mount lives in src/options.tsx so the surface and
+// the shared primitive/state layer stay in one place.
+import '../../../src/options.tsx';
