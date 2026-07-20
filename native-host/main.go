@@ -275,18 +275,22 @@ readLoop:
 					resp.Message = err.Error()
 					break
 				}
-				requestCtx, cancel := context.WithCancel(hostCtx)
-				state, err := engine.AddVideo(requestCtx, params)
-				cancel()
-				if err != nil {
-					resp.Status = "error"
-					resp.Message = err.Error()
-				} else {
+				// Resolve the manifest (several YouTube round-trips) off the read
+				// loop so other messages are not blocked while it runs.
+				dispatchAsync("", func(requestCtx context.Context) Response {
+					resp := Response{ID: req.ID}
+					state, err := engine.AddVideo(requestCtx, params)
+					if err != nil {
+						resp.Status = "error"
+						resp.Message = err.Error()
+						return resp
+					}
 					resp.Status = "ok"
 					resp.Payload = state
-					// Auto-start for now
-					engine.Start(state.ID)
-				}
+					_ = engine.Start(state.ID)
+					return resp
+				})
+				continue
 			case "media.resolve":
 				var params MediaResolveRequest
 				if err := decodeParams(req, &params); err != nil {

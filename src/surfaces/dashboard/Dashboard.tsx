@@ -95,14 +95,13 @@ export function Dashboard() {
     const idx = visible.findIndex((x) => x.id === d.id);
     setSelection((prev) => {
       const next = new Set(prev);
+      const key = String(d.id);
       if (e.shiftKey && lastIndex.current >= 0) {
         const [a, b] = [lastIndex.current, idx].sort((m, n) => m - n);
         for (let i = a; i <= b; i++) next.add(String(visible[i].id));
       } else if (e.metaKey || e.ctrlKey) {
-        const key = String(d.id);
         next.has(key) ? next.delete(key) : next.add(key);
       } else {
-        const key = String(d.id);
         if (next.has(key) && next.size === 1) next.delete(key);
         else { next.clear(); next.add(key); }
       }

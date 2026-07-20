@@ -128,6 +128,20 @@ function broadcastRuntimeMessage(message: Record<string, unknown>) {
   });
 }
 
+// isYouTubePageUrl matches watch/shorts/embed/youtu.be page URLs so manual adds
+// route to the YouTube adaptive extractor rather than the plain file downloader.
+function isYouTubePageUrl(rawUrl: unknown) {
+  try {
+    const host = new URL(String(rawUrl)).hostname.toLowerCase().replace(/^www\./, '');
+    return host === 'youtube.com'
+      || host.endsWith('.youtube.com')
+      || host === 'youtu.be'
+      || host === 'youtube-nocookie.com';
+  } catch {
+    return false;
+  }
+}
+
 function updateHostStatus(nextStatus: Partial<typeof hostStatus>) {
   hostStatus = { ...hostStatus, ...nextStatus };
   broadcastRuntimeMessage({ type: 'HOST_STATUS', payload: hostStatus });
@@ -1581,15 +1595,31 @@ browserApi.runtime.onMessage.addListener(((message: any, sender: any, sendRespon
           cookies: [],
         };
       })
-      .then((requestContext) => sendHostRequest('download.add', {
-        id: createDownloadRequestId(),
-        url: message.url,
-        filename,
-        segments: message.segments || 8,
-        schedule: message.schedule,
-        headers: requestContext.headers,
-        cookies: requestContext.cookies,
-      }))
+      .then((requestContext) => {
+        // YouTube serves separate video/audio adaptive streams that must be
+        // deciphered and reassembled from fragments; route to the video engine
+        // (youtube-dl method) instead of the plain file downloader.
+        if (isYouTubePageUrl(message.url)) {
+          return sendHostRequest('download.video', {
+            url: message.url,
+            // Empty filename lets the host name the file from the video title.
+            filename: '',
+            manifestType: 'YOUTUBE',
+            schedule: message.schedule,
+            headers: requestContext.headers,
+            cookies: requestContext.cookies,
+          });
+        }
+        return sendHostRequest('download.add', {
+          id: createDownloadRequestId(),
+          url: message.url,
+          filename,
+          segments: message.segments || 8,
+          schedule: message.schedule,
+          headers: requestContext.headers,
+          cookies: requestContext.cookies,
+        });
+      })
       .catch((error) => console.error('Failed to start manual download:', error));
     return false;
   }

@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	manifestTypeHLS  = "HLS"
-	manifestTypeDASH = "DASH"
+	manifestTypeHLS     = "HLS"
+	manifestTypeDASH    = "DASH"
+	manifestTypeYouTube = "YOUTUBE"
 )
 
 var isoDurationPattern = regexp.MustCompile(`^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$`)
@@ -36,11 +37,17 @@ type VideoManifest struct {
 	ManifestType      string
 	SelectedVariantID string
 	Container         string
+	Title             string
+	TotalBytes        int64
 	Variants          []VideoVariant
 	Segments          []Segment
 }
 
 func resolveVideoManifest(ctx context.Context, req VideoDownloadRequest) (*VideoManifest, error) {
+	if strings.EqualFold(strings.TrimSpace(req.ManifestType), manifestTypeYouTube) || isYouTubeURL(req.URL) {
+		return resolveYouTubeManifest(ctx, req)
+	}
+
 	rawManifest, finalURL, err := fetchManifest(ctx, req.URL, req.Headers, req.Cookies)
 	if err != nil {
 		return nil, err

@@ -58,6 +58,11 @@ func (e *Engine) AddVideo(ctx context.Context, req VideoDownloadRequest) (*Downl
 	if !knownSize {
 		totalSize = 0
 	}
+	// Some manifests (YouTube &range= fragments) leave per-segment sizes unknown
+	// but do know the exact total up front; use it so progress isn't stuck at 0%.
+	if !knownSize && manifest.TotalBytes > 0 {
+		totalSize = manifest.TotalBytes
+	}
 
 	id := fmt.Sprintf("%d%d", os.Getpid(), time.Now().UnixNano())
 	state := &DownloadState{
@@ -81,7 +86,11 @@ func (e *Engine) AddVideo(ctx context.Context, req VideoDownloadRequest) (*Downl
 		TrackCount:         len(manifest.Variants),
 	}
 
-	if err := e.assignDownloadTargetAndSave(state, ensureVideoFilename(req.Filename)); err != nil {
+	requestedName := req.Filename
+	if strings.TrimSpace(requestedName) == "" && strings.TrimSpace(manifest.Title) != "" {
+		requestedName = manifest.Title
+	}
+	if err := e.assignDownloadTargetAndSave(state, ensureVideoFilename(requestedName)); err != nil {
 		return nil, err
 	}
 
